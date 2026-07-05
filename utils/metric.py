@@ -106,7 +106,12 @@ class PD_FA():
     def get(self,img_num):
 
         Final_FA =  self.FA / ((self.size*self.size) * img_num)
-        Final_PD =  self.PD /self.target
+        Final_PD = np.divide(
+            self.PD,
+            self.target,
+            out=np.zeros_like(self.PD),
+            where=self.target != 0,
+        )
 
         return Final_FA,Final_PD
 
@@ -114,6 +119,7 @@ class PD_FA():
     def reset(self):
         self.FA  = np.zeros([self.bins+1])
         self.PD  = np.zeros([self.bins+1])
+        self.target = np.zeros([self.bins+1])
 
 class mIoU():
 
@@ -214,4 +220,3 @@ def batch_intersection_union(output, target, nclass):
     assert (area_inter <= area_union).all(), \
         "Error: Intersection area should be smaller than Union area"
     return area_inter, area_union
-

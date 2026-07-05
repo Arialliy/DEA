@@ -95,6 +95,11 @@ class MSHNet(nn.Module):
         self.output_3 = nn.Conv2d(param_channels[3], 1, 1)
 
         self.final = nn.Conv2d(4, 1, 3, 1, 1)
+        self.decidability_head = nn.Sequential(
+            nn.Conv2d(7, 8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, kernel_size=1)
+        )
 
 
     def _make_layer(self, in_channels, out_channels, block, block_num=1):
@@ -104,7 +109,49 @@ class MSHNet(nn.Module):
             layer.append(block(out_channels, out_channels))
         return nn.Sequential(*layer)
 
-    def forward(self, x, warm_flag):
+    def build_dea_lite_outputs(self, scale_logits, z_full):
+        if self.final.bias is None:
+            z_empty = torch.zeros_like(z_full)
+            bias = None
+        else:
+            bias = self.final.bias.view(1, 1, 1, 1)
+            z_empty = bias.expand_as(z_full)
+
+        only_weight = self.final.weight.permute(1, 0, 2, 3).contiguous()
+        z_only = F.conv2d(
+            scale_logits,
+            only_weight,
+            bias=None,
+            stride=self.final.stride,
+            padding=self.final.padding,
+            dilation=self.final.dilation,
+            groups=scale_logits.shape[1],
+        )
+        if bias is not None:
+            z_only = z_only + bias
+
+        z_only_max = z_only.max(dim=1, keepdim=True)[0]
+        z_only_var = z_only.var(dim=1, keepdim=True, unbiased=False)
+
+        d_input = torch.cat([
+            z_full,
+            z_only_max,
+            z_only_var,
+            scale_logits,
+        ], dim=1)
+
+        d_logit = self.decidability_head(d_input)
+
+        return {
+            "scale_logits": scale_logits,
+            "z_empty": z_empty,
+            "z_only": z_only,
+            "z_only_max": z_only_max,
+            "z_only_var": z_only_var,
+            "decidability_logit": d_logit,
+        }
+
+    def forward(self, x, warm_flag, return_dea=False):
         x_e0 = self.encoder_0(self.conv_init(x))
         x_e1 = self.encoder_1(self.pool(x_e0))
         x_e2 = self.encoder_2(self.pool(x_e1))
@@ -123,8 +170,20 @@ class MSHNet(nn.Module):
             mask1 = self.output_1(x_d1)
             mask2 = self.output_2(x_d2)
             mask3 = self.output_3(x_d3)
-            output = self.final(torch.cat([mask0, self.up(mask1), self.up_4(mask2), self.up_8(mask3)], dim=1))
-            return [mask0, mask1, mask2, mask3], output
+
+            s0 = mask0
+            s1 = self.up(mask1)
+            s2 = self.up_4(mask2)
+            s3 = self.up_8(mask3)
+
+            scale_logits = torch.cat([s0, s1, s2, s3], dim=1)
+            z_full = self.final(scale_logits)
+
+            if return_dea:
+                dea_out = self.build_dea_lite_outputs(scale_logits, z_full)
+                return [mask0, mask1, mask2, mask3], z_full, dea_out
+
+            return [mask0, mask1, mask2, mask3], z_full
     
         else:
             output = self.output_0(x_d0)

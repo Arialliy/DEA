@@ -9,6 +9,7 @@ import os.path as osp
 import sys
 import random
 import shutil
+import glob
 
 
 class IRSTD_Dataset(Data.Dataset):
@@ -18,10 +19,12 @@ class IRSTD_Dataset(Data.Dataset):
 
         if mode == 'train':
             txtfile = 'trainval.txt'
+            split_prefix = 'train'
         elif mode == 'val':
             txtfile = 'test.txt'
+            split_prefix = 'test'
 
-        self.list_dir = osp.join(dataset_dir, txtfile)
+        self.list_dir = self._resolve_split_file(dataset_dir, txtfile, split_prefix)
         self.imgs_dir = osp.join(dataset_dir, 'images')
         self.label_dir = osp.join(dataset_dir, 'masks')
 
@@ -37,6 +40,20 @@ class IRSTD_Dataset(Data.Dataset):
             transforms.ToTensor(),
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
+
+    def _resolve_split_file(self, dataset_dir, txtfile, split_prefix):
+        candidates = [osp.join(dataset_dir, txtfile)]
+        dataset_name = osp.basename(osp.normpath(dataset_dir))
+        candidates.append(osp.join(dataset_dir, 'img_idx', '%s_%s.txt' % (split_prefix, dataset_name)))
+        candidates.extend(sorted(glob.glob(osp.join(dataset_dir, 'img_idx', '%s_*.txt' % split_prefix))))
+
+        for candidate in candidates:
+            if osp.exists(candidate):
+                return candidate
+
+        raise FileNotFoundError(
+            'Could not find split file. Tried: %s' % ', '.join(candidates)
+        )
 
     def __getitem__(self, i):
         name = self.names[i]

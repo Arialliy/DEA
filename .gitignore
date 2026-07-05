@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+.DS_Store
+
+datasets/
+repro_data/
+repro_runs/
+weight/
