@@ -21,17 +21,48 @@ The NUAA failure suggests that loss-level evidence regularization is insufficien
 
 A full DEA method should explicitly model and intervene on evidence, rather than only regularizing training loss.
 
+Full DEA is a new structural method on top of the MSHNet source code.
+It is not a renamed DEA-lite run, not a new lambda value, and not a loss-only patch.
+
+## MSHNet Source-Level Insertion Rule
+
+The MSHNet encoder / multi-scale decoder should remain the base network.
+
+Full DEA may add modules only at explicit structural insertion points:
+
+```text
+1. after multi-scale decoder feature fusion
+2. before the final segmentation prediction head
+3. optionally as an auxiliary branch from decoder features
+```
+
+Full DEA must not change the dataset split, metric implementation, test threshold, or checkpoint selection rule to obtain gains.
+
 ## Required Structural Components
 
 A Full DEA implementation must include:
 
 ```text
-1. target evidence branch
-2. clutter evidence branch
-3. counterfactual intervention path
-4. real prediction and counterfactual prediction
-5. inference-time evidence gate or evidence-calibrated segmentation head
+1. target evidence branch E_t
+2. clutter/background evidence branch E_c
+3. counterfactual intervention path C(F, E_t, E_c)
+4. real prediction head y_real
+5. counterfactual prediction head y_cf
+6. inference-time evidence gate or evidence-calibrated segmentation head
 ```
+
+Minimum structural contract:
+
+```text
+F_dec = MSHNet decoder feature
+E_t, E_c = EvidenceHead(F_dec)
+F_cf = CounterfactualOperator(F_dec, E_t, E_c)
+y_real = SegHead(F_dec, E_t, E_c)
+y_cf = SegHead_cf(F_cf)
+y_final = EvidenceCalibratedHead(y_real, E_t, E_c)
+```
+
+The exact operator can be revised during design review, but the implementation must expose separate target evidence, clutter evidence, and counterfactual prediction tensors.
 
 ## Non-Goals
 
@@ -41,9 +72,13 @@ Full DEA must not be implemented as merely:
 MSHNet + another scalar loss
 MSHNet + lambda tuning
 DEA-lite with a new lambda
+DEA-lite 0.0025 / 0.005 / 0.01 sensitivity rescue
 post-hoc threshold adjustment
 dataset-specific lambda selection
 ```
+
+Loss terms may be used only after the structural branches exist.
+If the method can be disabled by setting only `--dea-lambda-single 0`, it is still DEA-lite rather than Full DEA.
 
 ## First Gate Dataset
 
@@ -94,15 +129,26 @@ The frozen references are not Full DEA evidence. They are the baseline and failu
 Full DEA on NUAA-SIRST must satisfy:
 
 ```text
-IoU >= 0.7461767422765062
-PD  >= 0.9569771863117871
-FA  <= 25.312477183119157
+MSHNet baseline reference:
+  IoU 0.7461767423
+  PD  0.9619771863
+  FA  25.3124771831
+
+DEA-lite 0.005 negative reference:
+  IoU 0.7126024590
+  PD  0.9353612167
+  FA  27.5228625146
+
+Full DEA first gate:
+  IoU >= 0.7461767423
+  PD  >= 0.9569771863
+  FA  <= 25.3124771831
 
 and Full DEA must outperform DEA-lite 0.005 on NUAA:
 
-IoU > 0.7126024590163934
-PD  > 0.935361216730038
-FA  < 27.522862514602807
+  IoU > 0.7126024590
+  PD  > 0.9353612167
+  FA  < 27.5228625146
 ```
 
 The PD tolerance is fixed before implementation:
@@ -111,6 +157,8 @@ The PD tolerance is fixed before implementation:
 PD tolerance = 0.005 absolute
 PD threshold = MSHNet baseline PD - 0.005
 ```
+
+If Full DEA fails this NUAA-first gate, stop and audit the structure before running NUDT-SIRST or IRSTD-1K.
 
 ## Failure Criteria
 
