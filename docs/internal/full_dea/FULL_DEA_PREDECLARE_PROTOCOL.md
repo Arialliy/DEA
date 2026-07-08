@@ -66,15 +66,97 @@ DEA-lite 0.005 negative result
 Full DEA candidate
 ```
 
+Frozen NUAA-SIRST references:
+
+```text
+MSHNet baseline best-IoU:
+  epoch 381
+  IoU 0.7461767422765062
+  PD  0.9619771863117871
+  FA  25.312477183119157
+
+DEA-lite 0.005 best-IoU:
+  epoch 324
+  IoU 0.7126024590163934
+  PD  0.935361216730038
+  FA  27.522862514602807
+
+DEA-lite 0.005 status:
+  gate_pass false
+  decision DEA_LITE_NEGATIVE_DATASET_DEPENDENT
+  num_gate_pass_epochs 0
+```
+
+The frozen references are not Full DEA evidence. They are the baseline and failure context for the first Full DEA gate.
+
 ## First Gate
 
 Full DEA on NUAA-SIRST must satisfy:
 
 ```text
-IoU >= MSHNet baseline
-PD  >= MSHNet baseline - tolerance
-FA  <= MSHNet baseline
-and Full DEA must outperform DEA-lite 0.005 on NUAA.
+IoU >= 0.7461767422765062
+PD  >= 0.9569771863117871
+FA  <= 25.312477183119157
+
+and Full DEA must outperform DEA-lite 0.005 on NUAA:
+
+IoU > 0.7126024590163934
+PD  > 0.935361216730038
+FA  < 27.522862514602807
+```
+
+The PD tolerance is fixed before implementation:
+
+```text
+PD tolerance = 0.005 absolute
+PD threshold = MSHNet baseline PD - 0.005
+```
+
+## Failure Criteria
+
+Full DEA fails the NUAA first gate if any of the following happens:
+
+```text
+1. IoU is below the MSHNet baseline IoU.
+2. PD is below MSHNet baseline PD - 0.005.
+3. FA is above the MSHNet baseline FA.
+4. Full DEA does not outperform DEA-lite 0.005 on IoU, PD, and FA.
+5. FA improves only because target detections collapse.
+```
+
+Partial recovery is not a success claim:
+
+```text
+Better than DEA-lite 0.005 but still worse than MSHNet baseline = diagnostic only.
+Lower FA with lower IoU/PD than MSHNet baseline = failure, not success.
+Single-seed success on NUAA = first-gate pass only, not a broad Full DEA claim.
+```
+
+## Fixed Evaluation Settings
+
+The first NUAA gate must use the same paired evaluation context:
+
+```text
+dataset_dir = /home/ly/DEA/datasets/NUAA-SIRST
+seed = 20260706
+deterministic = true
+batch_size = 4
+num_workers = 4
+pin_memory = false
+```
+
+Changing dataset split, metric implementation, thresholding policy, or checkpoint selection rule invalidates the paired first gate.
+
+## Prototype Entry Criteria
+
+Before any NUAA full training, the implementation branch must pass:
+
+```text
+python compile checks
+shape tests for target evidence, clutter evidence, counterfactual path, and prediction heads
+finite-loss tests for the full DEA loss
+counterfactual-path tests proving the path is used by the loss
+tiny subset smoke training only after shape/loss tests pass
 ```
 
 ## Evidence Rules
