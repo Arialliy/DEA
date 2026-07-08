@@ -22,6 +22,7 @@ def parse_metric(text: str, names: list[str]) -> float | None:
         patterns = [
             rf"\b{name}\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
             rf"\b{name}\b\s+([0-9]+(?:\.[0-9]+)?)",
+            rf"{name}\s*:\s*([0-9]+(?:\.[0-9]+)?)",
         ]
         for pat in patterns:
             matches = re.findall(pat, text, flags=re.IGNORECASE)
@@ -43,6 +44,7 @@ def main() -> None:
     p.add_argument("--checkpoint_epoch", required=True, type=int)
     p.add_argument("--weight_path", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--extra", action="append", default=[], help="Optional key=value metadata entries.")
     args = p.parse_args()
 
     log_path = Path(args.log).expanduser().resolve()
@@ -57,11 +59,20 @@ def main() -> None:
 
     text = log_path.read_text(encoding="utf-8", errors="replace")
 
-    iou = parse_metric(text, ["IoU", "iou", "mIoU", "miou"])
+    # Prefer final test summary lines such as "mIoU: ..." over tqdm progress
+    # descriptions such as "Epoch 1, IoU ...".
+    iou = parse_metric(text, ["mIoU", "miou", "IoU", "iou"])
     pd = parse_metric(text, ["PD", "Pd", "pd"])
     fa = parse_metric(text, ["FA", "Fa", "fa"])
-    metrics_found = all(v is not None for v in (iou, pd, fa))
 
+    extra: dict[str, Any] = {}
+    for item in args.extra:
+        if "=" not in item:
+            raise SystemExit(f"invalid --extra entry, expected key=value: {item}")
+        key, value = item.split("=", 1)
+        extra[key] = value
+
+    metrics_found = all(v is not None for v in (iou, pd, fa))
     result: dict[str, Any] = {
         "dataset": args.dataset,
         "method": args.method,
@@ -75,6 +86,7 @@ def main() -> None:
         "IoU": iou,
         "PD": pd,
         "FA": fa,
+        "extra": extra,
     }
 
     output_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")

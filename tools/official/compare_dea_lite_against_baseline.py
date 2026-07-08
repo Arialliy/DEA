@@ -29,6 +29,11 @@ def main() -> None:
     p.add_argument("--min_delta_iou", type=float, default=0.0)
     p.add_argument("--min_delta_pd", type=float, default=0.0)
     p.add_argument("--max_delta_fa", type=float, default=0.0)
+    p.add_argument(
+        "--allow_gate_fail",
+        action="store_true",
+        help="Write negative evidence JSON and return 0 even if the gate fails.",
+    )
     args = p.parse_args()
 
     base = read_json(args.baseline_json)
@@ -50,6 +55,7 @@ def main() -> None:
         and delta["FA"] <= args.max_delta_fa
     )
 
+    decision = "DEA_LITE_POSITIVE" if gate_pass else "DEA_LITE_NEGATIVE_DATASET_DEPENDENT"
     result = {
         "baseline": base,
         "candidate": cand,
@@ -60,14 +66,19 @@ def main() -> None:
             "max_delta_fa": args.max_delta_fa,
         },
         "gate_pass": gate_pass,
-        "decision": "DEA_LITE_POSITIVE" if gate_pass else "DEA_LITE_GATE_FAIL",
+        "decision": decision,
+        "interpretation": (
+            "candidate improves the paired baseline under the declared gate"
+            if gate_pass
+            else "candidate fails the paired gate; treat as dataset-dependent negative evidence unless audit invalidates the run"
+        ),
     }
 
     out = Path(args.output).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
 
-    if not gate_pass:
+    if (not gate_pass) and (not args.allow_gate_fail):
         raise SystemExit(3)
 
 

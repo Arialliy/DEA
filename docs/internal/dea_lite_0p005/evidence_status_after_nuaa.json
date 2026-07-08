@@ -1,0 +1,69 @@
+{
+  "dataset": "NUAA-SIRST",
+  "baseline": "MSHNet-baseline",
+  "candidate": "DEA-lite-0.005",
+  "decision": "DEA_LITE_NEGATIVE_DATASET_DEPENDENT",
+  "gate_pass": false,
+  "baseline_best_iou": {
+    "epoch": 381,
+    "IoU": 0.7461767422765062,
+    "PD": 0.9619771863117871,
+    "FA": 25.312477183119157,
+    "run_dir": "/home/ly/DEA/weight/MSHNet-2026-07-08-02-11-49",
+    "weight_path": "/home/ly/DEA/weight/MSHNet-2026-07-08-02-11-49/weight_nuaa_mshnet_baseline_best_iou_e381.pkl",
+    "weight_sha256": "7aae11090cd5362d8f6ffa33cc2b9b42189fdddc32d03b861bc50b2ecc23d8fa"
+  },
+  "candidate_best_iou": {
+    "epoch": 324,
+    "IoU": 0.7126024590163934,
+    "PD": 0.935361216730038,
+    "FA": 27.522862514602807,
+    "run_dir": "/home/ly/DEA/weight/MSHNet-2026-07-08-04-35-33",
+    "weight_path": "/home/ly/DEA/weight/MSHNet-2026-07-08-04-35-33/weight_nuaa_lambda_single_0p005_best_iou_e324.pkl",
+    "weight_sha256": "386acb80bd1b713aa2d3d6dcc385eaa74d62eb8a005469b5a26b5b89b09d4ab1"
+  },
+  "delta": {
+    "IoU": -0.0335742832601128,
+    "PD": -0.026615969581749055,
+    "FA": 2.21038533148365
+  },
+  "thresholds": {
+    "min_delta_iou": 0.0,
+    "min_delta_pd": 0.0,
+    "max_delta_fa": 0.0
+  },
+  "candidate_pdfa_best_artifact_status": "absent",
+  "epoch_metric_audit": {
+    "num_records": 400,
+    "num_gate_pass_epochs": 0,
+    "decision": "NO_GATE_PASS_EPOCH",
+    "best_iou_epoch": {
+      "epoch": 324,
+      "IoU": 0.7126,
+      "PD": 0.9354,
+      "FA": 27.5229
+    },
+    "lowest_fa_epoch": {
+      "epoch": 46,
+      "IoU": 0.5989,
+      "PD": 0.8289,
+      "FA": 7.9146
+    }
+  },
+  "evidence_paths": {
+    "archive_dir": "/home/ly/DEA/repro_runs/dea_lite_0p005_nuaa_negative_archive",
+    "paired_delta_json": "/home/ly/DEA/repro_runs/dea_lite_0p005_nuaa_negative_archive/nuaa_dea_lite_0p005_vs_mshnet_delta.json",
+    "epoch_metric_audit_json": "/home/ly/DEA/repro_runs/dea_lite_0p005_nuaa_negative_archive/nuaa_dea_lite_0p005_epoch_metric_audit.json",
+    "baseline_retest_log": "/home/ly/DEA/repro_runs/dea_lite_0p005_nuaa_negative_archive/nuaa_mshnet_baseline_best_iou_e381_retest.log",
+    "candidate_retest_log": "/home/ly/DEA/repro_runs/dea_lite_0p005_nuaa_negative_archive/nuaa_dea_lite_0p005_best_iou_e324_retest.log"
+  },
+  "claim_policy": {
+    "allowed": "DEA-lite 0.005 shows promising false-alarm control on NUDT-SIRST and IRSTD-1K, while NUAA-SIRST reveals dataset-dependent limitations under the current configuration.",
+    "forbidden": [
+      "DEA-lite 0.005 improves all datasets.",
+      "DEA-lite universally reduces false alarms.",
+      "DEA-lite is globally robust.",
+      "NUAA supports the main positive claim."
+    ]
+  }
+}
