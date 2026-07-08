@@ -12,13 +12,27 @@ FORBIDDEN_PATTERNS = [
     r"\bDEA\s+improves\b",
     r"\bDEA\s+reduces\s+false\s+alarms\b",
     r"\bDEA\s+solves\b",
+    r"\bDEA\s+achieves\b",
+    r"\bDEA\s+outperforms\b",
+    r"\bDEA\s+is\s+effective\b",
+    r"\bDEA\s+demonstrates\s+superior\b",
     r"\bfull\s+DEA\s+is\s+effective\b",
+    r"\bFull\s+DEA\s+results\b",
+    r"\bproposed\s+DEA\s+method\b",
     r"\bDEA-lite\s+validates\s+(the\s+)?full\s+DEA\b",
     r"\bDEA-lite\s+proves\s+(the\s+)?DEA\b",
     r"\bDEA-lite\s+is\s+(the\s+)?(proposed\s+)?full\s+DEA\b",
     r"\bDEA-lite\s+universally\s+improves\b",
     r"\buniversally\s+improves\s+IRSTD\b",
     r"\bDEA-lite\s+is\s+AAAI-ready\b",
+    r"\bDEA-lite\s+is\s+our\s+main\s+method\b",
+    r"\bDEA-lite\s+serves\s+as\s+the\s+full\s+DEA\b",
+    r"DEA\s*显著提升",
+    r"DEA\s*降低虚警",
+    r"DEA\s*有效",
+    r"DEA-lite\s*验证了\s*DEA",
+    r"DEA-lite\s*就是\s*完整\s*DEA",
+    r"DEA-lite\s*作为\s*主方法",
 ]
 
 NEGATION_HINTS = [
@@ -36,6 +50,20 @@ NEGATION_HINTS = [
     "不应",
 ]
 
+SUPPRESSED_SECTION_HINTS = [
+    "forbidden claims",
+    "forbidden_next_steps",
+    "non-goals",
+    "no-go",
+    "do not claim",
+    "it should not be described as",
+    "full dea must not be implemented as merely",
+    "不要",
+    "不能",
+    "禁止",
+    "不应",
+]
+
 DEFAULT_SCAN_TARGETS = [
     "README.md",
     "docs",
@@ -46,6 +74,12 @@ def is_negated_context(lines: list[str], idx: int) -> bool:
     start = max(0, idx - 6)
     context = "\n".join(lines[start : idx + 1]).lower()
     return any(hint in context for hint in NEGATION_HINTS)
+
+
+def is_suppressed_example_context(lines: list[str], idx: int) -> bool:
+    start = max(0, idx - 20)
+    context = "\n".join(lines[start : idx + 1]).lower()
+    return any(hint in context for hint in SUPPRESSED_SECTION_HINTS)
 
 
 def iter_markdown_files(root: Path, targets: list[str]) -> list[Path]:
@@ -69,29 +103,11 @@ def scan_file(path: Path, root: Path) -> list[dict[str, Any]]:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     violations: list[dict[str, Any]] = []
-    skip_next_fence = False
-    in_forbidden_fence = False
 
     for idx, line in enumerate(lines):
-        lower = line.lower()
-        if "forbidden claims" in lower or "do not claim" in lower:
-            skip_next_fence = True
-
-        if line.lstrip().startswith("```"):
-            if in_forbidden_fence:
-                in_forbidden_fence = False
-                continue
-            if skip_next_fence:
-                in_forbidden_fence = True
-                skip_next_fence = False
-                continue
-
-        if in_forbidden_fence:
-            continue
-
         for pat in FORBIDDEN_PATTERNS:
             if re.search(pat, line, flags=re.IGNORECASE):
-                if is_negated_context(lines, idx):
+                if is_negated_context(lines, idx) or is_suppressed_example_context(lines, idx):
                     continue
                 violations.append(
                     {

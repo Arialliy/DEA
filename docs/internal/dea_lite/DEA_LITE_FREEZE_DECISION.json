@@ -2,8 +2,9 @@
   "decision": "DEA_LITE_FROZEN_AS_PILOT_ABLATION_LIMITATION_EVIDENCE",
   "root": "/home/ly/DEA",
   "branch": "dea-lite-0p005-nuaa-negative-archive",
-  "commit": "6c537e905007d596c39c51e235ee638f1f25d87e",
-  "git_dirty_entry_count_after_freeze_files": 7,
+  "commit": "fd3415266b71f60cd9852e60191ea955f7c27037",
+  "git_dirty_entry_count_at_decision_write": 6,
+  "git_status_short_at_decision_write": " M scripts/official/freeze_dea_lite_method_after_nuaa.sh\n M tools/official/check_no_full_dea_claim_from_dea_lite.py\n?? DEA_lite_0p005_NUAA_negative_next_plan_and_code_changes.md\n?? DEA_lite_0p005_post_NUAA_negative_next_steps_and_code_changes.md\n?? DEA_lite_freeze_full_DEA_design_plan_and_code_changes.md\n?? DEA_lite_freeze_then_full_dea_predeclare_plan.md",
   "method_status": "DEA-lite is not full DEA",
   "evidence_status": {
     "NUDT-SIRST": "positive_anchor",

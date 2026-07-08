@@ -6,6 +6,16 @@ PYTHON=${PYTHON:-python3}
 
 cd "${ROOT}"
 
+EXPECTED_BRANCH=${EXPECTED_BRANCH:-dea-lite-0p005-nuaa-negative-archive}
+CURRENT_BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"
+
+if [[ "${CURRENT_BRANCH}" != "${EXPECTED_BRANCH}" ]]; then
+  echo "ERROR: wrong branch for DEA-lite freeze." >&2
+  echo "  expected: ${EXPECTED_BRANCH}" >&2
+  echo "  current : ${CURRENT_BRANCH}" >&2
+  exit 6
+fi
+
 METHOD_DIR="docs/internal/dea_lite"
 EVIDENCE_DIR="docs/internal/dea_lite_0p005"
 DECISION_JSON="${METHOD_DIR}/DEA_LITE_FREEZE_DECISION.json"
@@ -23,13 +33,27 @@ if [[ ! -d "${EVIDENCE_DIR}" ]]; then
   exit 3
 fi
 
+REQUIRED_EVIDENCE_FILES=(
+  "docs/internal/dea_lite_0p005/evidence_status_after_nuaa.md"
+  "docs/internal/dea_lite_0p005/evidence_status_after_nuaa.json"
+  "docs/internal/dea_lite_0p005/no_universal_positive_claims_check.json"
+)
+
+for f in "${REQUIRED_EVIDENCE_FILES[@]}"; do
+  if [[ ! -s "${f}" ]]; then
+    echo "ERROR: missing required DEA-lite 0.005 evidence file: ${f}" >&2
+    exit 7
+  fi
+done
+
 if [[ ! -f "tools/official/check_no_full_dea_claim_from_dea_lite.py" ]]; then
   echo "ERROR: missing claim guard tool." >&2
   exit 4
 fi
 
 # Protect method code from accidental freeze-commit contamination.
-PROTECTED_CHANGED="$(git diff --name-only -- model/MSHNet.py model/loss.py main.py utils 2>/dev/null || true)"
+# This catches staged, unstaged, and untracked implementation changes.
+PROTECTED_CHANGED="$(git status --short -- main.py model utils 2>/dev/null || true)"
 if [[ -n "${PROTECTED_CHANGED}" ]]; then
   echo "ERROR: protected implementation files have uncommitted changes:" >&2
   echo "${PROTECTED_CHANGED}" >&2
@@ -43,7 +67,9 @@ fi
 
 GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"
-GIT_DIRTY="$(git status --short 2>/dev/null | wc -l | tr -d ' ')"
+GIT_STATUS_SHORT="$(git status --short 2>/dev/null || true)"
+GIT_DIRTY_COUNT="$(printf "%s\n" "${GIT_STATUS_SHORT}" | sed '/^$/d' | wc -l | tr -d ' ')"
+GIT_STATUS_SHORT_JSON="$(printf "%s" "${GIT_STATUS_SHORT}" | "${PYTHON}" -c 'import json, sys; print(json.dumps(sys.stdin.read()))')"
 
 cat > "${DECISION_JSON}" <<JSON
 {
@@ -51,7 +77,8 @@ cat > "${DECISION_JSON}" <<JSON
   "root": "${ROOT}",
   "branch": "${GIT_BRANCH}",
   "commit": "${GIT_COMMIT}",
-  "git_dirty_entry_count_after_freeze_files": ${GIT_DIRTY},
+  "git_dirty_entry_count_at_decision_write": ${GIT_DIRTY_COUNT},
+  "git_status_short_at_decision_write": ${GIT_STATUS_SHORT_JSON},
   "method_status": "DEA-lite is not full DEA",
   "evidence_status": {
     "NUDT-SIRST": "positive_anchor",
