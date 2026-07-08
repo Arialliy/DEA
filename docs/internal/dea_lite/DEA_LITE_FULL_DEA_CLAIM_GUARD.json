@@ -6,7 +6,8 @@
   "scanned_files": [
     "README.md",
     "docs/internal/dea_lite/DEA_LITE_METHOD_FREEZE_AFTER_NUAA.md",
-    "docs/internal/dea_lite_0p005/evidence_status_after_nuaa.md"
+    "docs/internal/dea_lite_0p005/evidence_status_after_nuaa.md",
+    "docs/internal/full_dea/FULL_DEA_PREDECLARE_PROTOCOL.md"
   ],
   "violations": []
 }
