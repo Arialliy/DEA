@@ -1,8 +1,90 @@
+from dataclasses import dataclass
+from typing import Any
+
 import  numpy as np
 import torch.nn as nn
 import torch
 from skimage import measure
 import  numpy
+
+
+@dataclass(frozen=True)
+class ComponentMatchResult:
+    """Connected-component matching under the repository's PD/FA rule."""
+
+    prediction_label_map: np.ndarray
+    target_label_map: np.ndarray
+    prediction_regions: tuple[Any, ...]
+    target_regions: tuple[Any, ...]
+    matches: tuple[tuple[int, int, float], ...]
+    unmatched_prediction_indices: tuple[int, ...]
+    unmatched_target_indices: tuple[int, ...]
+
+
+def match_connected_components(
+    prediction,
+    target,
+    *,
+    max_centroid_distance=3.0,
+    connectivity=2,
+):
+    """Match binary components exactly as ``PD_FA.update`` historically did.
+
+    Targets are processed in ``regionprops`` order.  Each target can consume
+    its nearest still-unmatched prediction only when the centroid distance is
+    strictly smaller than ``max_centroid_distance``.
+    """
+
+    prediction_array = np.asarray(prediction)
+    target_array = np.asarray(target)
+    if prediction_array.ndim != 2 or target_array.ndim != 2:
+        raise ValueError("prediction and target must both be 2-D arrays")
+    if prediction_array.shape != target_array.shape:
+        raise ValueError("prediction and target shapes must match")
+
+    prediction_label_map = measure.label(
+        prediction_array.astype(bool), connectivity=connectivity
+    )
+    target_label_map = measure.label(
+        target_array.astype(bool), connectivity=connectivity
+    )
+    prediction_regions = tuple(measure.regionprops(prediction_label_map))
+    target_regions = tuple(measure.regionprops(target_label_map))
+
+    unmatched_predictions = list(range(len(prediction_regions)))
+    unmatched_targets = []
+    matches = []
+    for target_index, target_region in enumerate(target_regions):
+        if not unmatched_predictions:
+            unmatched_targets.extend(range(target_index, len(target_regions)))
+            break
+        target_centroid = np.asarray(target_region.centroid)
+        distances = [
+            np.linalg.norm(
+                np.asarray(prediction_regions[index].centroid) - target_centroid
+            )
+            for index in unmatched_predictions
+        ]
+        nearest_position = int(np.argmin(distances))
+        nearest_prediction = unmatched_predictions[nearest_position]
+        nearest_distance = float(distances[nearest_position])
+        if nearest_distance < float(max_centroid_distance):
+            matches.append(
+                (target_index, nearest_prediction, nearest_distance)
+            )
+            unmatched_predictions.pop(nearest_position)
+        else:
+            unmatched_targets.append(target_index)
+
+    return ComponentMatchResult(
+        prediction_label_map=prediction_label_map,
+        target_label_map=target_label_map,
+        prediction_regions=prediction_regions,
+        target_regions=target_regions,
+        matches=tuple(matches),
+        unmatched_prediction_indices=tuple(unmatched_predictions),
+        unmatched_target_indices=tuple(unmatched_targets),
+    )
 
 class ROCMetric():
     """Computes pixAcc and mIoU metric scores
@@ -84,34 +166,12 @@ class PD_FA():
                 )
                 labelss = (label_array[batch_index, 0] > 0.5).astype("int64")
 
-                pred_regions = list(
-                    measure.regionprops(measure.label(predits, connectivity=2))
-                )
-                label_regions = list(
-                    measure.regionprops(measure.label(labelss, connectivity=2))
-                )
-                self.target[iBin] += len(label_regions)
-
-                unmatched_predictions = list(pred_regions)
-                matched_targets = 0
-                for label_region in label_regions:
-                    if not unmatched_predictions:
-                        break
-                    centroid_label = np.asarray(label_region.centroid)
-                    distances = [
-                        np.linalg.norm(
-                            np.asarray(pred_region.centroid) - centroid_label
-                        )
-                        for pred_region in unmatched_predictions
-                    ]
-                    nearest_index = int(np.argmin(distances))
-                    if distances[nearest_index] < 3:
-                        unmatched_predictions.pop(nearest_index)
-                        matched_targets += 1
-
-                self.PD[iBin] += matched_targets
+                component_match = match_connected_components(predits, labelss)
+                self.target[iBin] += len(component_match.target_regions)
+                self.PD[iBin] += len(component_match.matches)
                 self.FA[iBin] += sum(
-                    region.area for region in unmatched_predictions
+                    component_match.prediction_regions[index].area
+                    for index in component_match.unmatched_prediction_indices
                 )
 
     def get(self,img_num=None):
