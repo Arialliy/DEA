@@ -1,7 +1,7 @@
 import torch
 
-from model.predictive_correction_mshnet import (
-    PredictiveCorrectionMSHNet,
+from model.dea_mshnet import (
+    DEAMSHNet,
     TiedPredictionOperator,
 )
 
@@ -31,7 +31,7 @@ def test_tied_operator_implements_numerical_adjoint():
 
 
 def test_group_norm_supports_non_multiple_of_four_state_width():
-    model = PredictiveCorrectionMSHNet(3, state_channels=10).eval()
+    model = DEAMSHNet(3, state_channels=10).eval()
     with torch.no_grad():
         output = model(torch.randn(1, 3, 32, 48), True, return_dict=True)
     assert output["pred"].shape == (1, 1, 32, 48)
@@ -39,7 +39,7 @@ def test_group_norm_supports_non_multiple_of_four_state_width():
 
 
 def test_model_has_one_shared_decoder_trajectory_and_expected_shapes():
-    model = PredictiveCorrectionMSHNet(3, state_channels=16).eval()
+    model = DEAMSHNet(3, state_channels=16).eval()
     x = torch.randn(1, 3, 64, 80)
 
     with torch.no_grad():
@@ -55,6 +55,7 @@ def test_model_has_one_shared_decoder_trajectory_and_expected_shapes():
     assert output["pred"].shape == (1, 1, 64, 80)
     assert len(output["states"]) == 5
     assert len(output["corrections"]) == 5
+    assert len(output["residuals_after"]) == 5
 
     forbidden = ("decoder_", "output_", "final", "decidability")
     assert not any(
@@ -71,7 +72,7 @@ def test_model_has_one_shared_decoder_trajectory_and_expected_shapes():
 
 def test_warm_flag_changes_only_auxiliary_loss_contract():
     torch.manual_seed(4)
-    model = PredictiveCorrectionMSHNet(3, state_channels=16).eval()
+    model = DEAMSHNet(3, state_channels=16).eval()
     x = torch.randn(1, 3, 32, 32)
 
     with torch.no_grad():
@@ -85,7 +86,7 @@ def test_warm_flag_changes_only_auxiliary_loss_contract():
 
 def test_all_new_parameters_receive_finite_gradient():
     torch.manual_seed(5)
-    model = PredictiveCorrectionMSHNet(3, state_channels=16).train()
+    model = DEAMSHNet(3, state_channels=16).train()
     output = model(
         torch.randn(2, 3, 32, 32),
         True,
@@ -110,7 +111,7 @@ def test_all_new_parameters_receive_finite_gradient():
 
 
 def test_pseudo_huber_influence_is_bounded_per_residual_channel():
-    model = PredictiveCorrectionMSHNet(
+    model = DEAMSHNet(
         3, state_channels=8, delta_init=0.7, delta_min=0.05
     )
     residual = torch.linspace(-1e4, 1e4, 101).view(1, 1, 1, -1)
@@ -118,11 +119,15 @@ def test_pseudo_huber_influence_is_bounded_per_residual_channel():
     influence = model._influence(residual)
 
     assert torch.all(influence.abs() <= model.delta + 1e-5)
+    assert torch.isfinite(influence).all()
+    model.legacy_influence_numerics = True
+    legacy_influence = model._influence(residual)
+    assert torch.allclose(influence, legacy_influence, atol=2e-4, rtol=2e-5)
 
 
 def test_each_initial_correction_reduces_its_scale_observation_energy():
     torch.manual_seed(6)
-    model = PredictiveCorrectionMSHNet(3, state_channels=16).eval()
+    model = DEAMSHNet(3, state_channels=16).eval()
     with torch.no_grad():
         model.prediction_operator.depthwise_weight.normal_(mean=0.0, std=0.4)
         model.prediction_operator.pointwise_weight.normal_(mean=0.0, std=0.3)

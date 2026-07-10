@@ -14,8 +14,8 @@ if ROOT not in sys.path:
 
 from main import Trainer, get_method_metadata, get_method_name, get_run_folder_name, validate_args
 from model.MSHNet import MSHNet
+from model.dea_mshnet import DEAMSHNet
 from model.full_dea_mshnet import FullDEAMSHNet
-from model.predictive_correction_mshnet import PredictiveCorrectionMSHNet
 
 
 def make_args(**kwargs):
@@ -136,26 +136,32 @@ def test_integrated_rejects_nonexclusive_hard_gate_interpolation() -> None:
         validate_args(args)
 
 
-def test_predictive_correction_method_name_exposes_state_width() -> None:
-    args = validate_args(make_args(model_type="predictive_correction"))
-    assert get_method_name(args) == "PredictiveCorrection-C32-Eta1"
+def test_dea_main_method_name_exposes_state_width() -> None:
+    args = validate_args(make_args(model_type="dea"))
+    assert get_method_name(args) == "DEA-v0-C32-Eta1"
     metadata = get_method_metadata(args)
-    assert metadata["predictive_state_channels"] == 32
-    assert metadata["predictive_step_size"] == 1.0
-    assert metadata["predictive_legacy_numerics"] is False
+    assert metadata["dea_state_channels"] == 32
+    assert metadata["dea_step_size"] == 1.0
+    assert metadata["dea_legacy_numerics"] is False
 
     half_step = validate_args(make_args(
-        model_type="predictive_correction",
+        model_type="dea",
         predictive_step_size=0.5,
         predictive_legacy_numerics=True,
     ))
     assert get_method_name(half_step) == (
-        "PredictiveCorrection-C32-Eta0p5-LegacyNum"
+        "DEA-v0-C32-Eta0p5-LegacyNum"
+    )
+    compatibility_alias = validate_args(make_args(
+        model_type="predictive_correction"
+    ))
+    assert get_method_name(compatibility_alias) == (
+        "PredictiveCorrection-C32-Eta1"
     )
 
 
-def test_predictive_checkpoint_metadata_rejects_numerics_mismatch() -> None:
-    args = validate_args(make_args(model_type="predictive_correction"))
+def test_dea_checkpoint_metadata_rejects_numerics_mismatch() -> None:
+    args = validate_args(make_args(model_type="dea"))
     trainer = Trainer.__new__(Trainer)
     trainer.args = args
     metadata = get_method_metadata(args)
@@ -164,25 +170,31 @@ def test_predictive_checkpoint_metadata_rejects_numerics_mismatch() -> None:
         trainer, {"method_meta": metadata}, check_split_hashes=False
     )
     incompatible = dict(metadata)
-    incompatible["predictive_legacy_numerics"] = True
+    incompatible["dea_legacy_numerics"] = True
     with pytest.raises(RuntimeError, match="legacy_numerics"):
         Trainer.validate_integrated_checkpoint_metadata(
             trainer, {"method_meta": incompatible}, check_split_hashes=False
         )
+    missing_field = dict(metadata)
+    missing_field.pop("dea_legacy_numerics")
+    with pytest.raises(RuntimeError, match="<missing>"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": missing_field}, check_split_hashes=False
+        )
 
 
-def test_predictive_partial_load_accepts_only_replaced_decoder_keys() -> None:
+def test_dea_partial_load_accepts_only_replaced_decoder_keys() -> None:
     torch.manual_seed(11)
     baseline = MSHNet(3)
-    predictive = PredictiveCorrectionMSHNet(3, state_channels=32)
+    predictive = DEAMSHNet(3, state_channels=32)
     trainer = Trainer.__new__(Trainer)
     trainer.model = predictive
 
     Trainer.load_model_state_partial(
         trainer,
         baseline.state_dict(),
-        allowed_missing_prefixes=PredictiveCorrectionMSHNet.BASELINE_MISSING_PREFIXES,
-        allowed_unexpected_prefixes=PredictiveCorrectionMSHNet.BASELINE_UNEXPECTED_PREFIXES,
+        allowed_missing_prefixes=DEAMSHNet.BASELINE_MISSING_PREFIXES,
+        allowed_unexpected_prefixes=DEAMSHNet.BASELINE_UNEXPECTED_PREFIXES,
     )
 
     assert torch.equal(
@@ -194,20 +206,20 @@ def test_predictive_partial_load_accepts_only_replaced_decoder_keys() -> None:
     )
 
 
-def test_predictive_correction_rejects_invalid_dynamics() -> None:
+def test_dea_main_rejects_invalid_dynamics() -> None:
     with pytest.raises(ValueError, match="state-channels"):
         validate_args(make_args(
-            model_type="predictive_correction",
+            model_type="dea",
             predictive_state_channels=1,
         ))
     with pytest.raises(ValueError, match="step-size"):
         validate_args(make_args(
-            model_type="predictive_correction",
+            model_type="dea",
             predictive_step_size=1.5,
         ))
     with pytest.raises(ValueError, match="delta-init"):
         validate_args(make_args(
-            model_type="predictive_correction",
+            model_type="dea",
             predictive_delta_init=0.01,
         ))
 

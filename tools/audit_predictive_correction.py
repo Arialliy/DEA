@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model.predictive_correction_mshnet import PredictiveCorrectionMSHNet
+from model.dea_mshnet import DEAMSHNet
 from utils.data import IRSTD_Dataset
 from utils.metric import PD_FA, mIoU
 
@@ -93,7 +93,7 @@ def main():
     args = parse_args()
     checkpoint, state_dict = load_checkpoint(args.checkpoint)
     config = model_config(checkpoint)
-    model = PredictiveCorrectionMSHNet(3, **config)
+    model = DEAMSHNet(3, **config)
     model.load_state_dict(state_dict, strict=True)
     device = torch.device(args.device)
     model.to(device).eval()

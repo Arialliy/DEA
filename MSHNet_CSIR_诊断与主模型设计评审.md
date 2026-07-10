@@ -1,5 +1,7 @@
 # MSHNet / DEAIntegratedMSHNet 诊断与主模型设计评审
 
+> **范围说明（2026-07-10）**：MSHNet 是开源 baseline；本文中的 DEAIntegratedMSHNet/CSIR 是历史诊断与控制原型，不是当前 DEA 主模型，也不是 DEA-lite。当前 DEA 结构、完整 400 epoch 结果和去留判断以 `MSHNet_伴随预测误差回写主模型设计评审.md` 为准。
+
 ## 总体判断
 
 **你的主判断是对的：现在应停止继续调 `lambda/margin`，冻结 DEAIntegratedMSHNet 为控制模型，先完成 frozen-baseline 的尺度诊断。**

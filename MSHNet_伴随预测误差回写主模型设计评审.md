@@ -1,4 +1,15 @@
-# 伴随预测误差回写主模型设计评审
+# DEA 主模型：伴随预测误差回写 v0 设计评审
+
+## 命名与模型边界
+
+本文只按下面的边界使用名称：
+
+- **MSHNet** 是开源 baseline；本项目使用它进行同协议比较，并在 DEA v0 中保留其 encoder 拓扑以隔离 decoder 结构变量，但不把 MSHNet 本身称为我们的模型；
+- **DEA** 是正在设计的完整主模型；本文的“伴随预测误差回写”是 DEA 的 v0 结构假设；
+- **DEA-lite** 是此前依附于 baseline 的轻量辅助正则/诊断实验，不是本文模型，也不能用它的正负结果代替 DEA 主模型结果；
+- **DEAIntegratedMSHNet / FullDEA** 是此前的结构原型或控制分支，不等于当前 DEA 主模型。
+
+因此，下文 400 epoch 对照的准确含义是：**DEA v0 对开源 MSHNet baseline**，不是 DEA-lite 对 MSHNet。
 
 ## 结论
 
@@ -468,7 +479,7 @@ E_s(h_s)-E_s(\bar h_s),
 
 ### 7.1 它已经不是概念图，而是完整替换了 MSHNet decoder
 
-当前实现位于 `model/predictive_correction_mshnet.py`，训练入口为 `main.py --model-type predictive_correction`。实际网络保留 `conv_init`、四级 encoder 和 `middle_layer`，完整删除以下 MSHNet 路径：
+DEA 的规范入口位于 `model/dea_mshnet.py`，训练入口为 `main.py --model-type dea`。底层 `model/predictive_correction_mshnet.py` 仅为兼容首轮探索 checkpoint 保留，不再作为模型公开名称。DEA v0 保留 MSHNet 的 `conv_init`、四级 encoder 和 `middle_layer`，完整删除以下 baseline 路径：
 
 - `decoder_0` 至 `decoder_3`；
 - `output_0` 至 `output_3`；
@@ -513,7 +524,7 @@ F_s\rightarrow A_s\rightarrow N\rightarrow y_s,
 
 ### 7.2 结构和数学约束已经通过的检查
 
-截至当前，相关定向命令为 22 passed：其中 11 项直接覆盖 predictive-correction，另 11 项验证其复用的主训练入口与共享行为。直接覆盖项包括：
+截至当前，相关定向命令为 22 passed：其中 11 项直接覆盖 DEA v0，另 11 项验证其复用的主训练入口与共享行为。直接覆盖项包括：
 
 - 非方形输入的五级张量尺寸和最终输出尺寸；
 - 所有新增参数均获得有限且非零的梯度；
@@ -526,45 +537,74 @@ F_s\rightarrow A_s\rightarrow N\rightarrow y_s,
 
 在状态宽度 \(C=32\) 时，模型总参数量为 2,837,267，其中替换 decoder 的路径共 17,345 个参数；本仓库 MSHNet 为 4,066,034 个参数。17,345 个参数的透明拆分为：五个 adapter 15,872，shared GroupNorm 64，shared \(K/K^\ast\) 权重 1,312，prior 32，\(\delta\) 32，readout 33。adapter 占该路径的 91.5%，但它们只有 \(1\times1\) 线性坐标变换能力。这一变化是 decoder 拓扑替换，不是给 MSHNet 旁挂注意力或路由模块。
 
-### 7.3 NUAA 划分与 100 epoch 中期结果
+### 7.3 NUAA 划分与前 100 epoch 阶段结果
 
 NUAA-SIRST 共 427 张图像：官方训练列表 213 张、官方测试列表 214 张。本轮模型选择只把官方 213 张训练集固定拆为 170 train / 43 validation；官方 214 张 test 完全没有参与模型选择。因此“170/43”不是 NUAA 的总规模。
 
-四组实验使用相同 split、seed、batch size、Adagrad、学习率、warm-up 和确定性设置。100 epoch 的 validation 最优结果为：
+四组实验使用相同 split、seed、batch size、Adagrad、学习率、warm-up 和确定性设置。下表严格限定为 epoch 索引 0–99 内按 IoU 选出的 checkpoint；PD/FA 是同一 epoch 的值，而不是各自独立挑选：
 
 | 模型 | 最优 epoch | IoU | PD | FA |
 |---|---:|---:|---:|---:|
 | MSHNet baseline | 88 | 0.6490 | 0.9048 | 10.2908 |
-| 本模型，\(C_h=32,\eta=1\) | 98 | **0.7192** | 0.9683 | 14.5491 |
-| 本模型，\(C_h=64,\eta=1\) | 98 | 0.7099 | **0.9841** | 26.6142 |
-| 本模型，\(C_h=32,\eta=0.5\) | 91 | 0.6811 | 0.9524 | 18.0976 |
+| DEA v0，\(C=32,\eta=1\) | 98 | **0.7192** | 0.9683 | 14.5491 |
+| DEA v0，\(C=64,\eta=1\) | 98 | 0.7099 | **0.9841** | 26.6142 |
+| DEA v0，\(C=32,\eta=0.5\) | 91 | 0.6811 | 0.9524 | 18.0976 |
 
-相对同协议 baseline，当前主配置 \(C_h=32,\eta=1\) 的中期 IoU 提升 0.0702、PD 提升 0.0635，但 FA 增加 4.2583。它说明该结构已经产生了明显不同且更有效的优化行为，也说明“抑制虚警”尚未被证明，不能仅凭 IoU 宣布模型成立。
+这一阶段只能说明 DEA v0 在前 100 epoch 具有更快的 IoU 上升和更高的阶段性 best，不能说明最终优势成立。
 
-四组训练目前正在同协议续跑至 400 epoch。最终去留要依据完整性能曲线与多指标 Pareto 关系，以及自然顺序/反向顺序、exact adjoint/独立 back-projection 等关键对照决定。逐级局部 energy 只负责检查实现是否遵守所定义的更新，不参与性能判优。
+### 7.4 完整 400 epoch 结果：当前版本没有通过主模型 gate
+
+四组均完成 epoch 0–399，进程退出码均为 0。按完整验证轨迹中的最佳 IoU checkpoint 比较：
+
+| 模型 | 最优 epoch | IoU | PD | FA |
+|---|---:|---:|---:|---:|
+| MSHNet baseline | 258 | **0.7471** | **0.9841** | **9.5811** |
+| DEA v0，\(C=32,\eta=1\) | 251 | 0.7274 | **0.9841** | 14.5491 |
+| DEA v0，\(C=64,\eta=1\) | 305 | 0.7321 | **0.9841** | 38.3244 |
+| DEA v0，\(C=32,\eta=0.5\) | 113 | 0.6945 | 0.9524 | 14.1942 |
+
+主配置相对 baseline 为 IoU -0.0197、PD 持平、FA +4.9680。baseline 的 epoch-258 checkpoint 同时具有更高 IoU、相同 PD 和更低 FA，因此严格支配三个 DEA v0 变体各自的最佳-IoU checkpoint。\(\eta=0.5\) 在部分低-FA operating points 位于全局 Pareto 前沿，但对应 IoU/PD 明显降低，不能据此把它选为主模型。
+
+### 7.5 最佳 checkpoint 的机制审计
+
+对 \(C=32,\eta=1\) 的 epoch-251 checkpoint，五级 readout 上采样到原分辨率后的 IoU 为：
+
+\[
+0.0081\rightarrow0.2397\rightarrow0.4898\rightarrow0.6864\rightarrow0.7274.
+\]
+
+四次非初始回写的平均 \(\|\Delta h_s\|/\|\bar h_s\|\) 为：
+
+\[
+0.5043,\quad0.3315,\quad0.1962,\quad0.1621.
+\]
+
+五级逐图 local observation energy violation fraction 全为 0；最细一级的 residual norm ratio 均值为 0.9655。由此可排除两个简单解释：
+
+- 网络没有退化成零更新；
+- 后两个尺度没有在平均意义上造成 segmentation prefix 崩塌，IoU 实际逐级上升。
+
+但它也暴露了能力上限：越到高分辨率，共享单步算子对 observation residual 的修正越弱。把宽度从 32 增到 64 只把最佳 IoU 提高到 0.7321，却把 FA 推高到 38.3244。因此当前失败不能靠继续增加状态宽度或微调 \(\eta\) 解决。
+
+本轮 0–399 epoch 进程从启动到退出始终使用 legacy 数值式 \(r/\sqrt{1+(r/\delta)^2}\)。当前磁盘代码已改为数学等价但更稳定的 \(\delta r/\operatorname{hypot}(r,\delta)\)，两者不保证 bitwise 相同；兼容开关与 checkpoint 元数据已加入，旧 checkpoint 审计显式使用 legacy 路径。上述结果不能与未来 stable-numerics 训练混称为严格同一实现。
+
+完整运行目录、split hash、checkpoint hash、源码版本限制和测试命令记录在 `repro_runs/dea_v0_nuaa_20260710_manifest.md`。
 
 ---
 
 ## 最终判断
 
-**对，这可以收敛为一个单一、清晰且可实现的主机制。**
+**DEA v0 的机制实现是正确的，但当前结构不能保留为最终 DEA 主模型。**
 
-而且它比原 CSIR 更强，因为：
+它确实完成了预期的结构替换：删除原 decoder、四个独立 heads 和 final fusion，只保留五个线性 adapter、一套共享 \(K/K^\ast\) 预测误差回写律和一个共享 readout。因此它不是旧网络上的模块堆叠，也不是只改变融合点。
 
-- 不再有自由 candidate；
-- 不再有三分类 router；
-- 不再有任意 residual update；
-- 不再保留 baseline fusion 旁路；
-- 五个尺度确实通过正在变化的状态发生递推；
-- 原 decoder、四 heads 和 final fusion 可以全部删除。
+但是完整训练已经否定了“这一版共享单步回写足以优于 MSHNet”的性能假设。现在应当：
 
-但需要采用下面这句作为最终机制定义：
+1. 将本版本冻结为 mechanics control，不再继续调 \(C\)、\(\eta\) 或 \(\delta\)；
+2. 先运行 shared \(K\) vs non-shared \(K_s\) 和 coarse-to-fine vs reverse/parallel 两个判别性控制；
+3. 若 non-shared 明显胜出，说明不同分辨率不适合直接共享同一个网格算子，下一版应改变共同观测坐标或构造尺度归一化算子，而不是堆五套 decoder；
+4. 若 shared/non-shared 都受限，则问题在“一尺度只做一次当前局部能量更新”，下一版必须改写为累计多尺度一致性状态方程，而不是再添加 attention、router 或 side fusion。
 
-> **模型将五级 encoder features 视为同一潜在场景状态的有序多分辨率观测。每个尺度先由共享线性观测算子预测其坐标对齐后的 encoder observation，再将鲁棒化的预测误差仅通过该算子的严格伴随回写到共享状态；所有尺度执行同一更新律，最终只从最细状态读取一次目标预测。**
+所以当前最准确的结论不是“模型已经设计成功”，而是：
 
-它目前是一个**合理且比 CSIR 更有潜力的主模型假设**，还不是已经成立的顶会贡献。决定它是否值得实现的关键，不是结构看起来是否漂亮，而是：
-
-1. baseline 是否确实存在可修复的尺度冲突；
-2. 自然粗到细顺序是否比并行或反向处理更有效；
-3. 严格 \(K/K^\ast\) 约束是否优于普通 learned residual decoder；
-4. shared \(K\) 是否没有被 non-shared \(K_s\) 明显击败。
+> **已经得到一个数学与工程上成立、但被 400 epoch 实验否定为最终主模型的结构性控制。它明确排除了模块堆叠路线，并把下一步问题收敛到“共享网格假设是否错误”与“单步局部一致性是否不足”这两个可判别分支。**

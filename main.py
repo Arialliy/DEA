@@ -9,7 +9,7 @@ from model.MSHNet import *
 from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
 from model.dea_integrated_mshnet import DEAIntegratedMSHNet
-from model.predictive_correction_mshnet import PredictiveCorrectionMSHNet
+from model.dea_mshnet import DEAMSHNet
 from model.dea_integrated_loss import residual_aligned_route_loss
 from model.full_dea_loss import (
     full_dea_aux_loss_v2,
@@ -29,6 +29,11 @@ import json
 PROJECT_DIR = osp.dirname(osp.abspath(__file__))
 DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
 DEFAULT_WEIGHT_DIR = osp.join(PROJECT_DIR, 'weight')
+DEA_MODEL_TYPES = ('dea', 'predictive_correction')
+
+
+def is_dea_main_model(model_type):
+    return model_type in DEA_MODEL_TYPES
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -167,7 +172,7 @@ def validate_args(args):
         if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
             raise FileNotFoundError(args.init_from_baseline)
 
-    if args.model_type == "predictive_correction":
+    if is_dea_main_model(args.model_type):
         if int(args.predictive_state_channels) < 4:
             raise ValueError("--predictive-state-channels must be >= 4.")
         if not 0.0 < float(args.predictive_step_size) <= 1.0:
@@ -190,7 +195,7 @@ def validate_args(args):
         )
         if any(float(value) != 0.0 for value in lite_lambdas):
             raise ValueError(
-                "Predictive correction and DEA-lite losses must not be mixed."
+                "DEA main-model training and DEA-lite losses must not be mixed."
             )
 
     if getattr(args, "mode", "train") == "train" and not getattr(args, "val_split_file", ""):
@@ -200,11 +205,13 @@ def validate_args(args):
     return args
 
 def get_method_name(args):
-    if args.model_type == "predictive_correction":
+    if is_dea_main_model(args.model_type):
         eta = ("%g" % float(
             getattr(args, "predictive_step_size", 1.0)
         )).replace("-", "m").replace(".", "p")
-        name = "PredictiveCorrection-C%d-Eta%s" % (
+        prefix = "DEA-v0" if args.model_type == "dea" else "PredictiveCorrection"
+        name = "%s-C%d-Eta%s" % (
+            prefix,
             int(getattr(args, "predictive_state_channels", 32)),
             eta,
         )
@@ -308,6 +315,22 @@ def get_method_metadata(args):
         "predictive_legacy_numerics": bool(
             getattr(args, "predictive_legacy_numerics", False)
         ),
+        "dea_version": "v0_adjoint_predictive_correction",
+        "dea_state_channels": int(
+            getattr(args, "predictive_state_channels", 32)
+        ),
+        "dea_step_size": float(
+            getattr(args, "predictive_step_size", 1.0)
+        ),
+        "dea_delta_init": float(
+            getattr(args, "predictive_delta_init", 1.0)
+        ),
+        "dea_delta_min": float(
+            getattr(args, "predictive_delta_min", 0.05)
+        ),
+        "dea_legacy_numerics": bool(
+            getattr(args, "predictive_legacy_numerics", False)
+        ),
         "dataset_dir": args.dataset_dir,
         "train_split_file": getattr(args, "train_split_file", ""),
         "val_split_file": getattr(args, "val_split_file", ""),
@@ -355,7 +378,7 @@ def parse_args():
         '--model-type',
         type=str,
         default='mshnet',
-        choices=['mshnet', 'full_dea', 'dea_integrated', 'predictive_correction'],
+        choices=['mshnet', 'dea', 'full_dea', 'dea_integrated', 'predictive_correction'],
     )
     parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--dea-lambda-single', type=float, default=0.0)
@@ -430,12 +453,25 @@ def parse_args():
     # controls in the experiment protocol.
     parser.add_argument('--integrated-route-loss-weight', type=float, default=0.0)
     parser.add_argument('--integrated-route-ramp-epochs', type=int, default=3)
-    parser.add_argument('--predictive-state-channels', type=int, default=32)
-    parser.add_argument('--predictive-step-size', type=float, default=1.0)
-    parser.add_argument('--predictive-delta-init', type=float, default=1.0)
-    parser.add_argument('--predictive-delta-min', type=float, default=0.05)
     parser.add_argument(
-        '--predictive-legacy-numerics',
+        '--dea-state-channels', '--predictive-state-channels',
+        dest='predictive_state_channels', type=int, default=32,
+    )
+    parser.add_argument(
+        '--dea-step-size', '--predictive-step-size',
+        dest='predictive_step_size', type=float, default=1.0,
+    )
+    parser.add_argument(
+        '--dea-delta-init', '--predictive-delta-init',
+        dest='predictive_delta_init', type=float, default=1.0,
+    )
+    parser.add_argument(
+        '--dea-delta-min', '--predictive-delta-min',
+        dest='predictive_delta_min', type=float, default=0.05,
+    )
+    parser.add_argument(
+        '--dea-legacy-numerics', '--predictive-legacy-numerics',
+        dest='predictive_legacy_numerics',
         type=str2bool,
         nargs='?',
         const=True,
@@ -528,8 +564,8 @@ class Trainer(object):
                 uncertain_margin=args.integrated_uncertain_margin,
                 isolate_route_gradients=args.integrated_isolate_route_gradients,
             )
-        elif args.model_type == "predictive_correction":
-            model = PredictiveCorrectionMSHNet(
+        elif is_dea_main_model(args.model_type):
+            model = DEAMSHNet(
                 3,
                 state_channels=args.predictive_state_channels,
                 step_size=args.predictive_step_size,
@@ -553,9 +589,9 @@ class Trainer(object):
             if args.model_type == "dea_integrated":
                 allowed_missing = DEAIntegratedMSHNet.BASELINE_MISSING_PREFIXES
                 allowed_unexpected = DEAIntegratedMSHNet.BASELINE_UNEXPECTED_PREFIXES
-            elif args.model_type == "predictive_correction":
-                allowed_missing = PredictiveCorrectionMSHNet.BASELINE_MISSING_PREFIXES
-                allowed_unexpected = PredictiveCorrectionMSHNet.BASELINE_UNEXPECTED_PREFIXES
+            elif is_dea_main_model(args.model_type):
+                allowed_missing = DEAMSHNet.BASELINE_MISSING_PREFIXES
+                allowed_unexpected = DEAMSHNet.BASELINE_UNEXPECTED_PREFIXES
             elif args.model_type == "full_dea":
                 allowed_missing = ("full_dea_head.", "decidability_head.")
                 allowed_unexpected = ()
@@ -699,9 +735,8 @@ class Trainer(object):
         checkpoint,
         check_split_hashes,
     ):
-        if self.args.model_type not in (
-            'dea_integrated',
-            'predictive_correction',
+        if self.args.model_type != 'dea_integrated' and not is_dea_main_model(
+            self.args.model_type
         ):
             return
         if not isinstance(checkpoint, dict) or 'method_meta' not in checkpoint:
@@ -730,7 +765,7 @@ class Trainer(object):
                 'integrated_isolate_route_gradients',
                 'test_split_sha256',
             )
-        else:
+        elif self.args.model_type == 'predictive_correction':
             semantic_keys = (
                 'model_type',
                 'predictive_state_channels',
@@ -738,6 +773,17 @@ class Trainer(object):
                 'predictive_delta_init',
                 'predictive_delta_min',
                 'predictive_legacy_numerics',
+                'test_split_sha256',
+            )
+        else:
+            semantic_keys = (
+                'model_type',
+                'dea_version',
+                'dea_state_channels',
+                'dea_step_size',
+                'dea_delta_init',
+                'dea_delta_min',
+                'dea_legacy_numerics',
                 'test_split_sha256',
             )
         if check_split_hashes:
@@ -1143,7 +1189,7 @@ class Trainer(object):
 
         torch.save(sample, osp.join(debug_dir, 'epoch_%04d_iter_%04d.pt' % (epoch, iteration)))
 
-    def predictive_correction_loss(self, state_logits, labels, epoch):
+    def dea_main_loss(self, state_logits, labels, epoch):
         """Match MSHNet's effective resolution weights without duplicate heads.
 
         MSHNet averages final, full-resolution side, half, quarter, and eighth
@@ -1195,7 +1241,7 @@ class Trainer(object):
             use_dea = self.use_dea(epoch)
 
             full_dea_out = None
-            predictive_out = None
+            dea_main_out = None
             if self.args.model_type == "full_dea":
                 out = self.model(data, tag, return_dict=True)
                 masks = out["masks"]
@@ -1207,19 +1253,19 @@ class Trainer(object):
                 masks = out["masks"]
                 pred = out["pred"]
                 dea_out = None
-            elif self.args.model_type == "predictive_correction":
+            elif is_dea_main_model(self.args.model_type):
                 return_details = (
                     self.args.predictive_log_interval > 0
                     and i % self.args.predictive_log_interval == 0
                 )
-                predictive_out = self.model(
+                dea_main_out = self.model(
                     data,
                     tag,
                     return_dict=True,
                     return_details=return_details,
                 )
                 masks = []
-                pred = predictive_out["pred"]
+                pred = dea_main_out["pred"]
                 dea_out = None
             elif use_dea:
                 masks, pred, dea_out = self.model(
@@ -1232,9 +1278,9 @@ class Trainer(object):
                 masks, pred = self.model(data, tag)
                 dea_out = None
 
-            if predictive_out is not None:
-                loss = self.predictive_correction_loss(
-                    predictive_out["state_logits"], labels, epoch
+            if dea_main_out is not None:
+                loss = self.dea_main_loss(
+                    dea_main_out["state_logits"], labels, epoch
                 )
             else:
                 loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
@@ -1392,16 +1438,16 @@ class Trainer(object):
                 print('[INTEGRATED DEA] ' + ' | '.join(msg))
 
             if (
-                predictive_out is not None
-                and "corrections" in predictive_out
+                dea_main_out is not None
+                and "corrections" in dea_main_out
             ):
                 core_model = (
                     self.model.module
                     if isinstance(self.model, nn.DataParallel)
                     else self.model
                 )
-                stats = core_model.state_statistics(predictive_out)
-                print('[PREDICTIVE CORRECTION] ' + ' | '.join(
+                stats = core_model.state_statistics(dea_main_out)
+                print('[DEA MAIN] ' + ' | '.join(
                     self.format_log_dict(stats)
                 ))
         
@@ -1437,8 +1483,7 @@ class Trainer(object):
                 if self.args.model_type in (
                     "full_dea",
                     "dea_integrated",
-                    "predictive_correction",
-                ):
+                ) or is_dea_main_model(self.args.model_type):
                     out = self.model(data, tag, return_dict=True)
                     pred = out["pred"]
                     if route_audit is not None:
