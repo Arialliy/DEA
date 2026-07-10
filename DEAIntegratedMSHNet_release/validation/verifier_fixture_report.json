@@ -1,0 +1,73 @@
+{
+  "all_routes_uncertain_at_initialization": true,
+  "baseline_trainable_parameters": 4066034,
+  "checkpoint": "/mnt/data/DEAIntegratedMSHNet_patch/_smoke_fixture/baseline_fixture.pt",
+  "checkpoint_missing_allowed": [
+    "dea_cell_3.encoder_projection.weight",
+    "dea_cell_3.decoder_projection.weight",
+    "dea_cell_3.route_predictor.weight",
+    "dea_cell_3.route_predictor.bias",
+    "dea_cell_3.update_depthwise.weight",
+    "dea_cell_3.update_pointwise.weight",
+    "dea_cell_3.update_pointwise.bias",
+    "dea_cell_2.encoder_projection.weight",
+    "dea_cell_2.decoder_projection.weight",
+    "dea_cell_2.route_predictor.weight",
+    "dea_cell_2.route_predictor.bias",
+    "dea_cell_2.update_depthwise.weight",
+    "dea_cell_2.update_pointwise.weight",
+    "dea_cell_2.update_pointwise.bias",
+    "dea_cell_1.encoder_projection.weight",
+    "dea_cell_1.decoder_projection.weight",
+    "dea_cell_1.route_predictor.weight",
+    "dea_cell_1.route_predictor.bias",
+    "dea_cell_1.update_depthwise.weight",
+    "dea_cell_1.update_pointwise.weight",
+    "dea_cell_1.update_pointwise.bias",
+    "dea_cell_0.encoder_projection.weight",
+    "dea_cell_0.decoder_projection.weight",
+    "dea_cell_0.route_predictor.weight",
+    "dea_cell_0.route_predictor.bias",
+    "dea_cell_0.update_depthwise.weight",
+    "dea_cell_0.update_pointwise.weight",
+    "dea_cell_0.update_pointwise.bias"
+  ],
+  "checkpoint_unexpected_allowed": [
+    "decidability_head.0.weight",
+    "decidability_head.0.bias",
+    "decidability_head.2.weight",
+    "decidability_head.2.bias"
+  ],
+  "device": "cpu",
+  "explicit_route_parameters": 20988,
+  "failures": [],
+  "final_decomposition_max_abs_error": 3.725290298461914e-08,
+  "forbidden_modules": [],
+  "initial_clutter_gate_nonzero_count": 0,
+  "initial_target_gate_nonzero_count": 0,
+  "input_shape": [
+    1,
+    3,
+    32,
+    32
+  ],
+  "integrated_trainable_parameters": 4086501,
+  "legacy_decidability_head_present": false,
+  "mask_max_abs_errors": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "net_parameter_difference_vs_current_repo_mshnet": 20467,
+  "passed": true,
+  "prediction_max_abs_error": 3.3527612686157227e-08,
+  "route_conv_gmacs": 0.00297984,
+  "route_conv_macs": 2979840,
+  "routing_cell_gradient_l1": {
+    "0": 0.03682746183403651,
+    "1": 0.029981035368109588,
+    "2": 0.007966502031194977,
+    "3": 0.008274475214420818
+  }
+}

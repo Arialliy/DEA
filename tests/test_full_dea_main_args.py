@@ -38,6 +38,17 @@ def make_args(**kwargs):
         full_dea_protect_kernel=9,
         full_dea_hard_min_area=1,
         full_dea_hard_max_area=256,
+        integrated_route_channels=16,
+        integrated_route_temperature=1.0,
+        integrated_routing_mode="dea",
+        integrated_decoder_routing=True,
+        integrated_scale_routing=True,
+        integrated_route_upsample_mode="nearest-exact",
+        integrated_update_limit=0.25,
+        integrated_uncertain_margin=1.0,
+        integrated_route_loss_weight=0.05,
+        integrated_route_ramp_epochs=3,
+        integrated_isolate_route_gradients=True,
         dataset_dir="datasets/NUAA-SIRST",
         seed=20260706,
         deterministic=True,
@@ -90,6 +101,30 @@ def test_run_folder_name_uses_method_name() -> None:
     assert get_run_folder_name(args, "2026-07-09-22-00-00") == (
         "FullDEA-v3-TPS-2026-07-09-22-00-00"
     )
+
+
+def test_integrated_method_name_exposes_residual_alignment() -> None:
+    args = validate_args(make_args(model_type="dea_integrated"))
+    assert get_method_name(args) == "DEAIntegrated-ResidualAligned"
+
+
+def test_integrated_rejects_route_loss_for_attention_control() -> None:
+    args = make_args(
+        model_type="dea_integrated",
+        integrated_routing_mode="attention",
+        integrated_route_loss_weight=0.05,
+    )
+    with pytest.raises(ValueError, match="not defined for the attention"):
+        validate_args(args)
+
+
+def test_integrated_rejects_nonexclusive_hard_gate_interpolation() -> None:
+    args = make_args(
+        model_type="dea_integrated",
+        integrated_route_upsample_mode="bilinear",
+    )
+    with pytest.raises(ValueError, match="Hard scale routing"):
+        validate_args(args)
 
 
 def test_frozen_backbone_keeps_batchnorm_statistics_fixed() -> None:

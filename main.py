@@ -3,10 +3,13 @@ from utils.metric import *
 from argparse import ArgumentParser, ArgumentTypeError
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data as Data
 from model.MSHNet import *
 from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
+from model.dea_integrated_mshnet import DEAIntegratedMSHNet
+from model.dea_integrated_loss import residual_aligned_route_loss
 from model.full_dea_loss import (
     full_dea_aux_loss_v2,
     full_dea_aux_loss_v3,
@@ -20,6 +23,7 @@ import time
 import glob
 import random
 import numpy as np
+import json
 
 PROJECT_DIR = osp.dirname(osp.abspath(__file__))
 DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
@@ -68,6 +72,59 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 def validate_args(args):
+    if getattr(args, "mode", "train") not in ("train", "test"):
+        raise ValueError("--mode must be train or test.")
+
+    if args.model_type == "dea_integrated":
+        if args.if_checkpoint and args.init_from_baseline:
+            raise ValueError("--if-checkpoint and --init-from-baseline are separate paths.")
+        if not args.init_from_baseline and not args.if_checkpoint and getattr(args, "mode", "train") == "train":
+            print("warning: Integrated DEA is running without --init-from-baseline.")
+        lite_lambdas = (
+            args.dea_lambda_single,
+            args.dea_lambda_dec,
+            args.dea_lambda_empty,
+        )
+        if any(float(value) != 0.0 for value in lite_lambdas):
+            raise ValueError(
+                "Integrated DEA and DEA-lite losses must not be enabled together."
+            )
+        if int(args.integrated_route_channels) < 1:
+            raise ValueError("--integrated-route-channels must be >= 1.")
+        if float(args.integrated_route_temperature) <= 0.0:
+            raise ValueError("--integrated-route-temperature must be > 0.")
+        if float(args.integrated_update_limit) <= 0.0:
+            raise ValueError("--integrated-update-limit must be > 0.")
+        if float(args.integrated_route_loss_weight) < 0.0:
+            raise ValueError("--integrated-route-loss-weight must be non-negative.")
+        if int(args.integrated_route_ramp_epochs) < 0:
+            raise ValueError("--integrated-route-ramp-epochs must be non-negative.")
+        if (
+            args.integrated_routing_mode == "attention"
+            and float(args.integrated_route_loss_weight) > 0.0
+        ):
+            raise ValueError(
+                "Residual action supervision is not defined for the attention "
+                "control; set --integrated-route-loss-weight 0."
+            )
+        if float(args.integrated_uncertain_margin) <= 0.1:
+            raise ValueError(
+                "--integrated-uncertain-margin must be > 0.1 to guarantee "
+                "the initial all-uncertain route."
+            )
+        if (
+            args.integrated_routing_mode == "dea"
+            and
+            args.integrated_scale_routing
+            and args.integrated_route_upsample_mode not in ("nearest", "nearest-exact")
+        ):
+            raise ValueError(
+                "Hard scale routing requires nearest/nearest-exact upsampling; "
+                "continuous interpolation destroys target/clutter exclusivity."
+            )
+        if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
+            raise FileNotFoundError(args.init_from_baseline)
+
     if args.model_type == "full_dea":
         if args.if_checkpoint and args.init_from_baseline:
             raise ValueError("--if-checkpoint and --init-from-baseline are separate paths.")
@@ -108,9 +165,33 @@ def validate_args(args):
             )
         if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
             raise FileNotFoundError(args.init_from_baseline)
+
+    if getattr(args, "mode", "train") == "train" and not getattr(args, "val_split_file", ""):
+        val_fraction = float(getattr(args, "val_fraction", 0.2))
+        if not 0.0 < val_fraction < 1.0:
+            raise ValueError("--val-fraction must be strictly between 0 and 1.")
     return args
 
 def get_method_name(args):
+    if args.model_type == "dea_integrated":
+        routing_mode = getattr(args, "integrated_routing_mode", "dea")
+        decoder_routing = bool(getattr(args, "integrated_decoder_routing", True))
+        scale_routing = bool(getattr(args, "integrated_scale_routing", True))
+        residual_aligned = (
+            float(getattr(args, "integrated_route_loss_weight", 0.0)) > 0.0
+        )
+        suffix = "-ResidualAligned" if residual_aligned else "-UnsupervisedRoute"
+        if routing_mode == "soft_tri":
+            return "DEAIntegrated-SoftTri" + suffix
+        if routing_mode == "attention":
+            return "DEAIntegrated-Attention"
+        if decoder_routing and scale_routing:
+            return "DEAIntegrated" + suffix
+        if decoder_routing:
+            return "DEAIntegrated-DecoderOnly" + suffix
+        if scale_routing:
+            return "DEAIntegrated-ScaleOnly" + suffix
+        return "DEAIntegrated-Identity" + suffix
     if args.model_type == "full_dea":
         version = getattr(args, "full_dea_version", "v3")
         if version == "v2":
@@ -126,6 +207,8 @@ def get_method_name(args):
         or args.dea_lambda_empty > 0
     ):
         return "DEA-lite"
+    if getattr(args, "init_from_baseline", ""):
+        return "MSHNet-Continued"
     return "MSHNet"
 
 def get_run_folder_name(args, timestamp=None):
@@ -139,7 +222,9 @@ def get_method_metadata(args):
         "method": get_method_name(args),
         "model_type": args.model_type,
         "full_dea_version": getattr(args, "full_dea_version", ""),
-        "init_from_baseline": args.init_from_baseline,
+        "init_from_baseline": getattr(
+            args, "origin_baseline_checkpoint", args.init_from_baseline
+        ),
         "full_dea_lambda": float(args.full_dea_lambda),
         "full_dea_ramp_epochs": int(args.full_dea_ramp_epochs),
         "full_dea_start_epoch": int(args.full_dea_start_epoch),
@@ -157,7 +242,28 @@ def get_method_metadata(args):
         "dea_lambda_single": float(args.dea_lambda_single),
         "dea_lambda_dec": float(args.dea_lambda_dec),
         "dea_lambda_empty": float(args.dea_lambda_empty),
+        "integrated_route_channels": int(getattr(args, "integrated_route_channels", 16)),
+        "integrated_route_temperature": float(getattr(args, "integrated_route_temperature", 1.0)),
+        "integrated_routing_mode": getattr(args, "integrated_routing_mode", ""),
+        "integrated_decoder_routing": bool(getattr(args, "integrated_decoder_routing", False)),
+        "integrated_scale_routing": bool(getattr(args, "integrated_scale_routing", False)),
+        "integrated_route_upsample_mode": getattr(args, "integrated_route_upsample_mode", ""),
+        "integrated_update_limit": float(getattr(args, "integrated_update_limit", 0.25)),
+        "integrated_uncertain_margin": float(getattr(args, "integrated_uncertain_margin", 1.0)),
+        "integrated_route_loss_weight": float(getattr(args, "integrated_route_loss_weight", 0.0)),
+        "integrated_route_ramp_epochs": int(getattr(args, "integrated_route_ramp_epochs", 0)),
+        "integrated_isolate_route_gradients": bool(
+            getattr(args, "integrated_isolate_route_gradients", True)
+        ),
         "dataset_dir": args.dataset_dir,
+        "train_split_file": getattr(args, "train_split_file", ""),
+        "val_split_file": getattr(args, "val_split_file", ""),
+        "test_split_file": getattr(args, "test_split_file", ""),
+        "val_fraction": float(getattr(args, "val_fraction", 0.2)),
+        "split_seed": int(getattr(args, "split_seed", getattr(args, "seed", 0))),
+        "train_split_sha256": getattr(args, "train_split_sha256", ""),
+        "val_split_sha256": getattr(args, "val_split_sha256", ""),
+        "test_split_sha256": getattr(args, "test_split_sha256", ""),
         "seed": int(args.seed),
         "deterministic": bool(args.deterministic),
     }
@@ -170,6 +276,11 @@ def parse_args():
     parser = ArgumentParser(description='Implement of model')
 
     parser.add_argument('--dataset-dir', type=str, default=DEFAULT_DATASET_DIR)
+    parser.add_argument('--train-split-file', type=str, default='')
+    parser.add_argument('--val-split-file', type=str, default='')
+    parser.add_argument('--test-split-file', type=str, default='')
+    parser.add_argument('--val-fraction', type=float, default=0.2)
+    parser.add_argument('--split-seed', type=int, default=20260706)
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=400)
@@ -184,14 +295,14 @@ def parse_args():
     parser.add_argument('--if-checkpoint', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--reset-optimizer', type=str2bool, nargs='?', const=True, default=False)
 
-    parser.add_argument('--mode', type=str, default='train')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--weight-path', type=str, default=osp.join(DEFAULT_WEIGHT_DIR, 'IRSTD-1k_weight.tar'))
     parser.add_argument('--checkpoint-dir', type=str, default='')
     parser.add_argument(
         '--model-type',
         type=str,
         default='mshnet',
-        choices=['mshnet', 'full_dea'],
+        choices=['mshnet', 'full_dea', 'dea_integrated'],
     )
     parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--dea-lambda-single', type=float, default=0.0)
@@ -230,6 +341,50 @@ def parse_args():
     parser.add_argument('--full-dea-hard-min-area', type=int, default=1)
     parser.add_argument('--full-dea-hard-max-area', type=int, default=256)
     parser.add_argument('--full-dea-debug', action='store_true')
+    parser.add_argument('--integrated-route-channels', type=int, default=16)
+    parser.add_argument('--integrated-route-temperature', type=float, default=1.0)
+    parser.add_argument(
+        '--integrated-routing-mode',
+        type=str,
+        default='dea',
+        choices=['dea', 'soft_tri', 'attention'],
+    )
+    parser.add_argument(
+        '--integrated-decoder-routing',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        '--integrated-scale-routing',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        '--integrated-route-upsample-mode',
+        type=str,
+        default='nearest-exact',
+        choices=['nearest', 'nearest-exact', 'bilinear', 'bicubic'],
+    )
+    parser.add_argument('--integrated-update-limit', type=float, default=0.25)
+    parser.add_argument('--integrated-uncertain-margin', type=float, default=1.0)
+    # Experimental identifiability control.  It is disabled by default because
+    # the first real-data smoke drove every hard route to keep/abstain; it must
+    # not be presented as a validated formal objective without the prescribed
+    # controls in the experiment protocol.
+    parser.add_argument('--integrated-route-loss-weight', type=float, default=0.0)
+    parser.add_argument('--integrated-route-ramp-epochs', type=int, default=3)
+    parser.add_argument(
+        '--integrated-isolate-route-gradients',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=True,
+    )
+    parser.add_argument('--integrated-log-interval', type=int, default=50)
 
     args = parser.parse_args()
     return validate_args(args)
@@ -239,38 +394,55 @@ class Trainer(object):
         assert args.mode == 'train' or args.mode == 'test'
 
         self.args = args
+        setattr(args, 'origin_baseline_checkpoint', args.init_from_baseline)
         self.start_epoch = 0   
         self.mode = args.mode
 
-        trainset = IRSTD_Dataset(args, mode='train')
-        valset = IRSTD_Dataset(args, mode='val')
+        self.train_dataset = None
+        if args.mode == 'train':
+            trainset = IRSTD_Dataset(args, mode='train')
+            valset = IRSTD_Dataset(args, mode='val')
+            test_reference = IRSTD_Dataset(args, mode='test')
+            self.assert_disjoint_splits(trainset, valset, test_reference)
+            self.train_dataset = trainset
+            setattr(args, 'train_split_sha256', trainset.split_sha256)
+            setattr(args, 'val_split_sha256', valset.split_sha256)
+            setattr(args, 'test_split_sha256', test_reference.split_sha256)
+        else:
+            valset = IRSTD_Dataset(args, mode='test')
+            setattr(args, 'test_split_sha256', valset.split_sha256)
+        self.val_dataset = valset
 
-        data_generator = torch.Generator()
-        data_generator.manual_seed(args.seed)
+        def loader_kwargs(generator_seed):
+            data_generator = torch.Generator()
+            data_generator.manual_seed(generator_seed)
+            kwargs = {
+                "num_workers": args.num_workers,
+                "pin_memory": args.pin_memory,
+                "persistent_workers": args.num_workers > 0,
+                "worker_init_fn": seed_worker,
+                "generator": data_generator,
+            }
+            if args.num_workers > 0:
+                kwargs["prefetch_factor"] = 2
+            return kwargs
 
-        loader_kwargs = {
-            "num_workers": args.num_workers,
-            "pin_memory": args.pin_memory,
-            "persistent_workers": args.num_workers > 0,
-            "worker_init_fn": seed_worker,
-            "generator": data_generator,
-        }
-        if args.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 2
-
-        self.train_loader = Data.DataLoader(
-            trainset,
-            args.batch_size,
-            shuffle=True,
-            drop_last=True,
-            **loader_kwargs,
-        )
+        self.train_loader = None
+        if self.train_dataset is not None:
+            self.train_loader = Data.DataLoader(
+                self.train_dataset,
+                args.batch_size,
+                shuffle=True,
+                drop_last=True,
+                **loader_kwargs(args.seed),
+            )
         self.val_loader = Data.DataLoader(
             valset,
             1,
             drop_last=False,
-            **loader_kwargs,
+            **loader_kwargs(args.seed + 1),
         )
+        self.print_split_summary()
 
         device = torch.device('cuda')
         self.device = device
@@ -278,6 +450,19 @@ class Trainer(object):
 
         if args.model_type == "full_dea":
             model = FullDEAMSHNet(3, full_dea_version=args.full_dea_version)
+        elif args.model_type == "dea_integrated":
+            model = DEAIntegratedMSHNet(
+                3,
+                route_channels=args.integrated_route_channels,
+                route_temperature=args.integrated_route_temperature,
+                routing_mode=args.integrated_routing_mode,
+                decoder_routing=args.integrated_decoder_routing,
+                scale_routing=args.integrated_scale_routing,
+                route_upsample_mode=args.integrated_route_upsample_mode,
+                update_limit=args.integrated_update_limit,
+                uncertain_margin=args.integrated_uncertain_margin,
+                isolate_route_gradients=args.integrated_isolate_route_gradients,
+            )
         else:
             model = MSHNet(3)
 
@@ -291,9 +476,21 @@ class Trainer(object):
         if args.mode == 'train' and args.init_from_baseline and not args.if_checkpoint:
             baseline = load_torch_file(args.init_from_baseline)
             state_dict = self.extract_state_dict(baseline)
+            if args.model_type == "dea_integrated":
+                allowed_missing = DEAIntegratedMSHNet.BASELINE_MISSING_PREFIXES
+                allowed_unexpected = DEAIntegratedMSHNet.BASELINE_UNEXPECTED_PREFIXES
+            elif args.model_type == "full_dea":
+                allowed_missing = ("full_dea_head.", "decidability_head.")
+                allowed_unexpected = ()
+            else:
+                # The pristine public MSHNet checkpoint predates the optional
+                # DEA-lite head present in this repository.
+                allowed_missing = ("decidability_head.",)
+                allowed_unexpected = ()
             self.load_model_state_partial(
                 state_dict,
-                allowed_missing_prefixes=("full_dea_head.",),
+                allowed_missing_prefixes=allowed_missing,
+                allowed_unexpected_prefixes=allowed_unexpected,
             )
 
         self.optimizer = Adagrad(filter(lambda p: p.requires_grad, self.model.parameters()), lr=args.lr)
@@ -314,6 +511,18 @@ class Trainer(object):
             if args.if_checkpoint:
                 check_folder = args.checkpoint_dir or self.find_latest_checkpoint_folder()
                 checkpoint = load_torch_file(osp.join(check_folder, 'checkpoint.pkl'))
+                self.validate_integrated_checkpoint_metadata(
+                    checkpoint,
+                    check_split_hashes=True,
+                )
+                if args.model_type == 'dea_integrated':
+                    setattr(
+                        args,
+                        'origin_baseline_checkpoint',
+                        checkpoint.get('method_meta', {}).get(
+                            'init_from_baseline', ''
+                        ),
+                    )
                 self.load_model_state(checkpoint['net'])
                 if args.reset_optimizer:
                     print('reset optimizer state')
@@ -336,9 +545,14 @@ class Trainer(object):
                     get_run_folder_name(args),
                 )
                 os.makedirs(self.save_folder, exist_ok=True)
+            self.persist_split_manifests()
         if args.mode=='test':
           
             weight = load_torch_file(args.weight_path)
+            self.validate_integrated_checkpoint_metadata(
+                weight,
+                check_split_hashes=False,
+            )
             state_dict = self.extract_state_dict(weight)
             self.load_model_state(state_dict)
             '''
@@ -347,6 +561,113 @@ class Trainer(object):
                 self.model.load_state_dict(weight)
             '''
             self.warm_epoch = -1
+
+    @staticmethod
+    def assert_disjoint_splits(trainset, valset, testset):
+        named_sets = {
+            'train': set(trainset.names),
+            'val': set(valset.names),
+            'test': set(testset.names),
+        }
+        for left, right in (('train', 'val'), ('train', 'test'), ('val', 'test')):
+            overlap = sorted(named_sets[left].intersection(named_sets[right]))
+            if overlap:
+                raise RuntimeError(
+                    '%s/%s split leakage detected (%d samples), e.g. %s'
+                    % (left, right, len(overlap), overlap[:5])
+                )
+
+    def print_split_summary(self):
+        if self.train_dataset is not None:
+            print(
+                'split train: n=%d sha256=%s source=%s'
+                % (
+                    len(self.train_dataset),
+                    self.train_dataset.split_sha256[:12],
+                    self.train_dataset.split_source,
+                )
+            )
+            print(
+                'split val:   n=%d sha256=%s source=%s'
+                % (
+                    len(self.val_dataset),
+                    self.val_dataset.split_sha256[:12],
+                    self.val_dataset.split_source,
+                )
+            )
+        else:
+            print(
+                'split test:  n=%d sha256=%s source=%s'
+                % (
+                    len(self.val_dataset),
+                    self.val_dataset.split_sha256[:12],
+                    self.val_dataset.split_source,
+                )
+            )
+
+    def persist_split_manifests(self):
+        if self.mode != 'train':
+            return
+        for split_name, dataset in (
+            ('train', self.train_dataset),
+            ('val', self.val_dataset),
+        ):
+            manifest_path = osp.join(self.save_folder, 'split_%s.txt' % split_name)
+            with open(manifest_path, 'w') as f:
+                for name in dataset.names:
+                    f.write(name + '\n')
+
+    def validate_integrated_checkpoint_metadata(
+        self,
+        checkpoint,
+        check_split_hashes,
+    ):
+        if self.args.model_type != 'dea_integrated':
+            return
+        if not isinstance(checkpoint, dict) or 'method_meta' not in checkpoint:
+            raise RuntimeError(
+                'Integrated DEA resume/test requires a checkpoint containing '
+                'method_meta; use checkpoint.pkl/checkpoint_best_iou.pkl rather '
+                'than a raw weight.pkl file.'
+            )
+
+        metadata = checkpoint['method_meta']
+        expected = get_method_metadata(self.args)
+        semantic_keys = (
+            'model_type',
+            'integrated_route_channels',
+            'integrated_route_temperature',
+            'integrated_routing_mode',
+            'integrated_decoder_routing',
+            'integrated_scale_routing',
+            'integrated_route_upsample_mode',
+            'integrated_update_limit',
+            'integrated_uncertain_margin',
+            'integrated_route_loss_weight',
+            'integrated_route_ramp_epochs',
+            'integrated_isolate_route_gradients',
+            'test_split_sha256',
+        )
+        if check_split_hashes:
+            semantic_keys = semantic_keys + (
+                'train_split_sha256',
+                'val_split_sha256',
+            )
+
+        mismatches = []
+        for key in semantic_keys:
+            if key not in metadata:
+                mismatches.append('%s=<missing>' % key)
+            elif metadata[key] != expected[key]:
+                mismatches.append(
+                    '%s checkpoint=%r cli=%r'
+                    % (key, metadata[key], expected[key])
+                )
+        if mismatches:
+            raise RuntimeError(
+                'Integrated DEA checkpoint semantics mismatch: %s'
+                % '; '.join(mismatches)
+            )
 
     def parse_gpu_ids(self, gpu_ids):
         if gpu_ids:
@@ -398,7 +719,12 @@ class Trainer(object):
 
         raise RuntimeError('Failed to load model state_dict.')
 
-    def load_model_state_partial(self, state_dict, allowed_missing_prefixes=()):
+    def load_model_state_partial(
+        self,
+        state_dict,
+        allowed_missing_prefixes=(),
+        allowed_unexpected_prefixes=(),
+    ):
         target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         if state_dict and all(key.startswith('module.') for key in state_dict.keys()):
             state_dict = {key[len('module.'):]: value for key, value in state_dict.items()}
@@ -409,10 +735,15 @@ class Trainer(object):
             for key in missing
             if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
         ]
-        if bad_missing or unexpected:
+        bad_unexpected = [
+            key
+            for key in unexpected
+            if not any(key.startswith(prefix) for prefix in allowed_unexpected_prefixes)
+        ]
+        if bad_missing or bad_unexpected:
             raise RuntimeError(
-                'Partial baseline load failed. bad_missing=%s unexpected=%s'
-                % (bad_missing, unexpected)
+                'Partial baseline load failed. bad_missing=%s bad_unexpected=%s'
+                % (bad_missing, bad_unexpected)
             )
         print(
             'loaded baseline with partial state: missing=%d unexpected=%d'
@@ -439,7 +770,7 @@ class Trainer(object):
         
     def use_dea(self, epoch):
         return (
-            self.args.model_type != "full_dea"
+            self.args.model_type == "mshnet"
             and
             epoch > self.warm_epoch
             and (
@@ -452,6 +783,11 @@ class Trainer(object):
     def get_forward_tag(self, epoch):
         if self.args.model_type == "full_dea":
             return epoch >= self.args.full_dea_start_epoch
+        if self.args.model_type == "dea_integrated":
+            # Integrated DEA is a continued-training method over a complete
+            # MSHNet checkpoint; terminal scale routing must be exercised from
+            # the first optimization step.
+            return True
         return epoch > self.warm_epoch
 
     def get_full_dea_ramp(self, epoch):
@@ -492,6 +828,198 @@ class Trainer(object):
             except (TypeError, ValueError):
                 pass
         return msg
+
+    @staticmethod
+    def new_integrated_route_audit():
+        return {
+            "route_counts": [torch.zeros(3, dtype=torch.long) for _ in range(4)],
+            "gt_route_counts": [torch.zeros(3, dtype=torch.long) for _ in range(4)],
+            "bg_route_counts": [torch.zeros(3, dtype=torch.long) for _ in range(4)],
+            "entropy_sum": [0.0] * 4,
+            "entropy_count": [0] * 4,
+            "transitions": [torch.zeros((3, 3), dtype=torch.long) for _ in range(3)],
+            "delta_abs_sum": [0.0] * 4,
+            "delta_count": [0] * 4,
+            "target_prob_fn_sum": [0.0] * 4,
+            "target_prob_fn_count": [0] * 4,
+            "clutter_prob_fp_sum": [0.0] * 4,
+            "clutter_prob_fp_count": [0] * 4,
+            "keep_prob_correct_sum": [0.0] * 4,
+            "keep_prob_correct_count": [0] * 4,
+            "hard_action_condition_hits": [torch.zeros(3, dtype=torch.long) for _ in range(4)],
+            "hard_action_condition_totals": [torch.zeros(3, dtype=torch.long) for _ in range(4)],
+            "delta_residual_aligned": [0] * 4,
+            "delta_residual_active": [0] * 4,
+        }
+
+    @staticmethod
+    def update_integrated_route_audit(audit, output, target):
+        routes = output["routes"]
+        preclosure_probability = torch.sigmoid(
+            output["scale_fusion"]["z_base"].detach()
+        )
+        binary_target_full = target > 0.5
+        false_negative = binary_target_full & (preclosure_probability < 0.5)
+        false_positive = (~binary_target_full) & (preclosure_probability >= 0.5)
+        correct = ~(false_negative | false_positive)
+        for scale, route in enumerate(routes):
+            winner = route["winner"].detach()
+            probabilities = route["probabilities"].detach().clamp_min(1e-12)
+            entropy = -(probabilities * probabilities.log()).sum(dim=1)
+            audit["route_counts"][scale] += torch.bincount(
+                winner.reshape(-1).cpu(), minlength=3
+            )
+            audit["entropy_sum"][scale] += float(entropy.sum().item())
+            audit["entropy_count"][scale] += int(entropy.numel())
+
+            target_at_scale = F.adaptive_max_pool2d(
+                target.float(), output_size=winner.shape[-2:]
+            )[:, 0] > 0.5
+            gt_winner = winner[target_at_scale]
+            bg_winner = winner[~target_at_scale]
+            if gt_winner.numel():
+                audit["gt_route_counts"][scale] += torch.bincount(
+                    gt_winner.reshape(-1).cpu(), minlength=3
+                )
+            if bg_winner.numel():
+                audit["bg_route_counts"][scale] += torch.bincount(
+                    bg_winner.reshape(-1).cpu(), minlength=3
+                )
+
+            probabilities_full = F.interpolate(
+                probabilities,
+                size=target.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+            winner_full = F.interpolate(
+                winner.unsqueeze(1).float(),
+                size=target.shape[-2:],
+                mode='nearest',
+            ).long()
+            conditions = (
+                (false_negative, 0, "target_prob_fn"),
+                (false_positive, 1, "clutter_prob_fp"),
+                (correct, 2, "keep_prob_correct"),
+            )
+            for condition, action, prefix in conditions:
+                count = int(condition.sum().item())
+                audit[prefix + "_count"][scale] += count
+                if count:
+                    audit[prefix + "_sum"][scale] += float(
+                        probabilities_full[:, action:action + 1][condition].sum().item()
+                    )
+                    audit["hard_action_condition_hits"][scale][action] += int(
+                        (winner_full[condition] == action).sum().item()
+                    )
+                audit["hard_action_condition_totals"][scale][action] += count
+
+        # routes are fine-to-coarse.  Each matrix row is the coarse state and
+        # each column is the corresponding next-finer state.
+        for fine_scale in range(3):
+            fine = routes[fine_scale]["winner"].detach()
+            coarse = routes[fine_scale + 1]["winner"].detach()
+            coarse_up = F.interpolate(
+                coarse.unsqueeze(1).float(),
+                size=fine.shape[-2:],
+                mode='nearest',
+            ).squeeze(1).long()
+            pair_index = (coarse_up * 3 + fine).reshape(-1).cpu()
+            audit["transitions"][fine_scale] += torch.bincount(
+                pair_index, minlength=9
+            ).reshape(3, 3)
+
+        deltas = output["scale_fusion"]["deltas"].detach()
+        for scale in range(4):
+            scale_delta = deltas[:, scale]
+            audit["delta_abs_sum"][scale] += float(scale_delta.abs().sum().item())
+            audit["delta_count"][scale] += int(scale_delta.numel())
+            desired_direction = (
+                binary_target_full.to(scale_delta.dtype)
+                - preclosure_probability
+            )[:, 0]
+            active = scale_delta.abs() > 0
+            audit["delta_residual_active"][scale] += int(active.sum().item())
+            audit["delta_residual_aligned"][scale] += int(
+                ((scale_delta * desired_direction > 0) & active).sum().item()
+            )
+
+    def finalize_integrated_route_audit(self, audit, epoch):
+        def normalized(counts):
+            total = int(counts.sum().item())
+            if total == 0:
+                return [0.0, 0.0, 0.0]
+            return [float(value) / float(total) for value in counts.tolist()]
+
+        report = {
+            "epoch": int(epoch),
+            "mode": self.mode,
+            "evaluation_split_sha256": self.val_dataset.split_sha256,
+            "state_order": [
+                "increase/target",
+                "decrease/clutter",
+                "keep/abstain",
+            ],
+            "route_occupancy": [normalized(item) for item in audit["route_counts"]],
+            "gt_route_occupancy": [normalized(item) for item in audit["gt_route_counts"]],
+            "bg_route_occupancy": [normalized(item) for item in audit["bg_route_counts"]],
+            "route_entropy": [
+                audit["entropy_sum"][scale]
+                / max(1, audit["entropy_count"][scale])
+                for scale in range(4)
+            ],
+            "coarse_to_fine_transitions": [
+                matrix.tolist() for matrix in audit["transitions"]
+            ],
+            "scale_delta_abs_mean": [
+                audit["delta_abs_sum"][scale]
+                / max(1, audit["delta_count"][scale])
+                for scale in range(4)
+            ],
+            "target_probability_on_false_negative": [
+                audit["target_prob_fn_sum"][scale]
+                / max(1, audit["target_prob_fn_count"][scale])
+                for scale in range(4)
+            ],
+            "clutter_probability_on_false_positive": [
+                audit["clutter_prob_fp_sum"][scale]
+                / max(1, audit["clutter_prob_fp_count"][scale])
+                for scale in range(4)
+            ],
+            "keep_probability_on_correct": [
+                audit["keep_prob_correct_sum"][scale]
+                / max(1, audit["keep_prob_correct_count"][scale])
+                for scale in range(4)
+            ],
+            "hard_action_condition_accuracy": [
+                [
+                    float(audit["hard_action_condition_hits"][scale][action])
+                    / max(
+                        1,
+                        int(audit["hard_action_condition_totals"][scale][action]),
+                    )
+                    for action in range(3)
+                ]
+                for scale in range(4)
+            ],
+            "delta_residual_sign_alignment": [
+                float(audit["delta_residual_aligned"][scale])
+                / max(1, audit["delta_residual_active"][scale])
+                for scale in range(4)
+            ],
+        }
+        serialized = json.dumps(report, sort_keys=True)
+        print('[INTEGRATED DEA VAL] ' + serialized)
+        if self.mode == 'train':
+            with open(osp.join(self.save_folder, 'route_metric.jsonl'), 'a') as f:
+                f.write(serialized + '\n')
+
+        if all(item[2] > 0.999999 for item in report["route_occupancy"]):
+            print(
+                'warning: Integrated DEA remains all keep/abstain on the entire '
+                'evaluation split; the current forward mapping is still the baseline.'
+            )
+        return report
 
     def save_dea_debug(self, epoch, iteration, data, labels, pred, dea_out):
         if not self.args.save_dea_debug:
@@ -543,6 +1071,11 @@ class Trainer(object):
                 pred = out["pred"]
                 full_dea_out = out["full_dea"]
                 dea_out = None
+            elif self.args.model_type == "dea_integrated":
+                out = self.model(data, tag, return_dict=True)
+                masks = out["masks"]
+                pred = out["pred"]
+                dea_out = None
             elif use_dea:
                 masks, pred, dea_out = self.model(
                     data,
@@ -565,6 +1098,29 @@ class Trainer(object):
                 
             loss = loss / (len(masks)+1)
             loss_seg_for_debug = loss.detach()
+            integrated_route_loss = None
+            integrated_route_log = {}
+            integrated_route_ramp = 0.0
+            if (
+                self.args.model_type == "dea_integrated"
+                and self.args.integrated_route_loss_weight > 0.0
+            ):
+                integrated_route_loss, integrated_route_log = (
+                    residual_aligned_route_loss(out, labels)
+                )
+                if self.args.integrated_route_ramp_epochs > 0:
+                    integrated_route_ramp = min(
+                        1.0,
+                        float(epoch + 1)
+                        / float(self.args.integrated_route_ramp_epochs),
+                    )
+                else:
+                    integrated_route_ramp = 1.0
+                loss = loss + (
+                    self.args.integrated_route_loss_weight
+                    * integrated_route_ramp
+                    * integrated_route_loss
+                )
 
             if self.args.model_type == "full_dea" and full_dea_out is not None:
                 ramp = self.get_full_dea_ramp(epoch)
@@ -654,6 +1210,37 @@ class Trainer(object):
                     ]
                     msg.extend(self.format_log_dict(dea_log))
                     print('[DEA DEBUG] ' + ' | '.join(msg))
+
+            if (
+                self.args.model_type == "dea_integrated"
+                and self.args.integrated_log_interval > 0
+                and i % self.args.integrated_log_interval == 0
+            ):
+                core_model = (
+                    self.model.module
+                    if isinstance(self.model, nn.DataParallel)
+                    else self.model
+                )
+                route_stats = core_model.route_statistics(out["routes"])
+                msg = self.format_log_dict(route_stats)
+                if "scale_fusion" in out:
+                    deltas = out["scale_fusion"]["deltas"]
+                    msg.append('scale_delta_abs=%.6f' % float(deltas.detach().abs().mean()))
+                if integrated_route_loss is not None:
+                    weighted_route_loss = (
+                        self.args.integrated_route_loss_weight
+                        * integrated_route_ramp
+                        * integrated_route_loss.detach()
+                    )
+                    msg.extend([
+                        'route_ramp=%.4f' % integrated_route_ramp,
+                        'route_loss_raw=%.6f' % float(integrated_route_loss.detach()),
+                        'route_loss_weighted=%.6f' % float(weighted_route_loss),
+                        'route_to_seg=%.6f'
+                        % float(weighted_route_loss / (loss_seg_for_debug + 1e-6)),
+                    ])
+                    msg.extend(self.format_log_dict(integrated_route_log))
+                print('[INTEGRATED DEA] ' + ' | '.join(msg))
         
             self.optimizer.zero_grad()
             loss.backward()
@@ -668,22 +1255,27 @@ class Trainer(object):
         self.PD_FA.reset()
         self.ROC.reset()
         tbar = tqdm(self.val_loader)
-        tag = False
+        # A saved model must always be evaluated through its complete
+        # multi-scale inference graph.  Tying this to a training epoch silently
+        # bypassed final fusion in the old test entry point.
+        tag = True
+        route_audit = (
+            self.new_integrated_route_audit()
+            if self.args.model_type == "dea_integrated"
+            else None
+        )
         with torch.no_grad():
             for i, (data, mask) in enumerate(tbar):
     
                 data = data.to(self.device, non_blocking=True)
                 mask = mask.to(self.device, non_blocking=True)
 
-                if self.args.model_type == "full_dea":
-                    tag = True
-                elif epoch>self.warm_epoch:
-                    tag = True
-
                 loss = 0
-                if self.args.model_type == "full_dea":
+                if self.args.model_type in ("full_dea", "dea_integrated"):
                     out = self.model(data, tag, return_dict=True)
                     pred = out["pred"]
+                    if route_audit is not None:
+                        self.update_integrated_route_audit(route_audit, out, mask)
                 else:
                     _, pred = self.model(data, tag)
                 # loss += self.loss_fun(pred, mask,self.warm_epoch, epoch)
@@ -697,6 +1289,8 @@ class Trainer(object):
             FA, PD = self.PD_FA.get(len(self.val_loader))
             _, mean_IoU = self.mIoU.get()
             ture_positive_rate, false_positive_rate, _, _ = self.ROC.get()
+            if route_audit is not None:
+                self.finalize_integrated_route_audit(route_audit, epoch)
 
             
             if self.mode == 'train':

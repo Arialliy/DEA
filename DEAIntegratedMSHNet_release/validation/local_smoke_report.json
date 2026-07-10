@@ -1,0 +1,35 @@
+{
+  "status": "mechanics_passed_method_hypothesis_not_yet_supported",
+  "dataset": "NUAA-SIRST",
+  "official_counts": {
+    "total": 427,
+    "official_train": 213,
+    "official_test": 214
+  },
+  "smoke_holdout": {
+    "fit": 170,
+    "validation": 43,
+    "fit_sha256": "e40f56767dc087928d7a267fb1b6a1f1a4d463c89295cf5916af9745738716b3",
+    "validation_sha256": "e9156e9386b4cd15b587536f20e5e6ab7db04b41c00a01e2b59c5a49673ca86f"
+  },
+  "unsupervised_route_smoke": {
+    "checkpoint_dir": "/home/ly/DEA/weight/DEAIntegrated-2026-07-10-15-36-53",
+    "uncertain_margin": 0.11,
+    "validation_iou": 0.7706,
+    "validation_pd": 1.0,
+    "validation_fa_per_million": 6.7423,
+    "target_occupancy_all_scales": 0.0,
+    "conclusion": "increase/target action was not identifiable"
+  },
+  "residual_alignment_control": {
+    "checkpoint_dir": "/home/ly/DEA/weight/DEAIntegrated-ResidualAligned-2026-07-10-15-53-58",
+    "uncertain_margin": 0.2,
+    "route_loss_weight": 0.05,
+    "validation_iou": 0.7693,
+    "validation_pd": 1.0,
+    "validation_fa_per_million": 6.7423,
+    "hard_keep_occupancy_all_scales": 1.0,
+    "conclusion": "soft consistency control did not cross the hard-action boundary"
+  },
+  "paper_use_warning": "The historical initialization checkpoint used the official test set for model selection and all 213 official training images for fitting. These numbers validate execution only and must not enter a leakage-free paper table."
+}

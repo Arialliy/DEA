@@ -10,28 +10,48 @@ import sys
 import random
 import shutil
 import glob
+import hashlib
 
 
 class IRSTD_Dataset(Data.Dataset):
     def __init__(self, args, mode='train'):
-        
+        if mode not in ('train', 'val', 'test'):
+            raise ValueError("Unknown dataset mode: %s" % mode)
+
         dataset_dir = args.dataset_dir
 
-        if mode == 'train':
+        if mode in ('train', 'val'):
             txtfile = 'trainval.txt'
             split_prefix = 'train'
-        elif mode == 'val':
+        else:
             txtfile = 'test.txt'
             split_prefix = 'test'
 
-        self.list_dir = self._resolve_split_file(dataset_dir, txtfile, split_prefix)
+        split_override = (
+            getattr(args, 'train_split_file', '')
+            if mode in ('train', 'val')
+            else getattr(args, 'test_split_file', '')
+        )
+        self.list_dir = self._resolve_split_file(
+            dataset_dir, txtfile, split_prefix, split_override
+        )
         self.imgs_dir = osp.join(dataset_dir, 'images')
         self.label_dir = osp.join(dataset_dir, 'masks')
 
-        self.names = []
-        with open(self.list_dir, 'r') as f:
-            self.names += [line.strip() for line in f.readlines()]
-
+        source_names = self._read_names(self.list_dir)
+        self.split_source = self.list_dir
+        if mode in ('train', 'val'):
+            train_names, val_names = self._split_train_validation(
+                source_names,
+                mode=mode,
+                val_fraction=float(getattr(args, 'val_fraction', 0.2)),
+                split_seed=int(getattr(args, 'split_seed', getattr(args, 'seed', 0))),
+                explicit_val_file=getattr(args, 'val_split_file', ''),
+                dataset_dir=dataset_dir,
+            )
+            self.names = train_names if mode == 'train' else val_names
+        else:
+            self.names = source_names
 
         self.mode = mode
         self.crop_size = args.crop_size
@@ -40,8 +60,70 @@ class IRSTD_Dataset(Data.Dataset):
             transforms.ToTensor(),
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
+        self.split_sha256 = hashlib.sha256(
+            ('\n'.join(self.names) + '\n').encode('utf-8')
+        ).hexdigest()
 
-    def _resolve_split_file(self, dataset_dir, txtfile, split_prefix):
+    @staticmethod
+    def _read_names(path):
+        with open(path, 'r') as f:
+            names = [line.strip() for line in f if line.strip()]
+        if not names:
+            raise ValueError('Empty split file: %s' % path)
+        if len(names) != len(set(names)):
+            raise ValueError('Duplicate sample names in split file: %s' % path)
+        return names
+
+    def _split_train_validation(
+        self,
+        source_names,
+        mode,
+        val_fraction,
+        split_seed,
+        explicit_val_file,
+        dataset_dir,
+    ):
+        if len(source_names) < 2:
+            raise ValueError('At least two training samples are required for a holdout split.')
+
+        if explicit_val_file:
+            val_path = explicit_val_file
+            if not osp.isabs(val_path):
+                val_path = osp.join(dataset_dir, val_path)
+            val_names = self._read_names(val_path)
+            self.split_source = '%s + val=%s' % (self.list_dir, val_path)
+            # With explicit manifests, the train file is already the fit set;
+            # Trainer performs the fail-closed overlap audit across all three
+            # manifests.  This also supports an official validation set that
+            # is not a subset of the source training list.
+            return source_names, val_names
+
+        if not 0.0 < val_fraction < 1.0:
+            raise ValueError('val_fraction must be strictly between 0 and 1.')
+
+        ranked_names = sorted(
+            source_names,
+            key=lambda name: hashlib.sha256(
+                ('%d\0%s' % (split_seed, name)).encode('utf-8')
+            ).digest(),
+        )
+        num_val = max(1, min(len(source_names) - 1, int(round(len(source_names) * val_fraction))))
+        val_set = set(ranked_names[:num_val])
+        # Preserve the source-file order in both subsets so evaluation is
+        # stable and the train loader remains the only shuffled component.
+        train_names = [name for name in source_names if name not in val_set]
+        val_names = [name for name in source_names if name in val_set]
+        return train_names, val_names
+
+    def _resolve_split_file(self, dataset_dir, txtfile, split_prefix, split_override=''):
+        if split_override:
+            override_path = split_override
+            if not osp.isabs(override_path):
+                override_path = osp.join(dataset_dir, override_path)
+            if not osp.isfile(override_path):
+                raise FileNotFoundError(override_path)
+            return override_path
+
         candidates = [osp.join(dataset_dir, txtfile)]
         dataset_name = osp.basename(osp.normpath(dataset_dir))
         candidates.append(osp.join(dataset_dir, 'img_idx', '%s_%s.txt' % (split_prefix, dataset_name)))
@@ -65,10 +147,10 @@ class IRSTD_Dataset(Data.Dataset):
 
         if self.mode == 'train':
             img, mask = self._sync_transform(img, mask)
-        elif self.mode == 'val':
+        elif self.mode in ('val', 'test'):
             img, mask = self._testval_sync_transform(img, mask)
         else:
-            raise ValueError("Unkown self.mode")
+            raise ValueError("Unknown self.mode")
 
         
         img, mask = self.transform(img), transforms.ToTensor()(mask)
