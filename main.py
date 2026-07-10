@@ -9,6 +9,7 @@ from model.MSHNet import *
 from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
 from model.dea_integrated_mshnet import DEAIntegratedMSHNet
+from model.predictive_correction_mshnet import PredictiveCorrectionMSHNet
 from model.dea_integrated_loss import residual_aligned_route_loss
 from model.full_dea_loss import (
     full_dea_aux_loss_v2,
@@ -166,6 +167,32 @@ def validate_args(args):
         if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
             raise FileNotFoundError(args.init_from_baseline)
 
+    if args.model_type == "predictive_correction":
+        if int(args.predictive_state_channels) < 4:
+            raise ValueError("--predictive-state-channels must be >= 4.")
+        if not 0.0 < float(args.predictive_step_size) <= 1.0:
+            raise ValueError("--predictive-step-size must be in (0, 1].")
+        if float(args.predictive_delta_min) <= 0.0:
+            raise ValueError("--predictive-delta-min must be > 0.")
+        if float(args.predictive_delta_init) <= float(args.predictive_delta_min):
+            raise ValueError(
+                "--predictive-delta-init must be greater than "
+                "--predictive-delta-min."
+            )
+        if int(args.predictive_log_interval) < 0:
+            raise ValueError("--predictive-log-interval must be non-negative.")
+        if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
+            raise FileNotFoundError(args.init_from_baseline)
+        lite_lambdas = (
+            args.dea_lambda_single,
+            args.dea_lambda_dec,
+            args.dea_lambda_empty,
+        )
+        if any(float(value) != 0.0 for value in lite_lambdas):
+            raise ValueError(
+                "Predictive correction and DEA-lite losses must not be mixed."
+            )
+
     if getattr(args, "mode", "train") == "train" and not getattr(args, "val_split_file", ""):
         val_fraction = float(getattr(args, "val_fraction", 0.2))
         if not 0.0 < val_fraction < 1.0:
@@ -173,6 +200,17 @@ def validate_args(args):
     return args
 
 def get_method_name(args):
+    if args.model_type == "predictive_correction":
+        eta = ("%g" % float(
+            getattr(args, "predictive_step_size", 1.0)
+        )).replace("-", "m").replace(".", "p")
+        name = "PredictiveCorrection-C%d-Eta%s" % (
+            int(getattr(args, "predictive_state_channels", 32)),
+            eta,
+        )
+        if bool(getattr(args, "predictive_legacy_numerics", False)):
+            name += "-LegacyNum"
+        return name
     if args.model_type == "dea_integrated":
         routing_mode = getattr(args, "integrated_routing_mode", "dea")
         decoder_routing = bool(getattr(args, "integrated_decoder_routing", True))
@@ -255,6 +293,21 @@ def get_method_metadata(args):
         "integrated_isolate_route_gradients": bool(
             getattr(args, "integrated_isolate_route_gradients", True)
         ),
+        "predictive_state_channels": int(
+            getattr(args, "predictive_state_channels", 32)
+        ),
+        "predictive_step_size": float(
+            getattr(args, "predictive_step_size", 1.0)
+        ),
+        "predictive_delta_init": float(
+            getattr(args, "predictive_delta_init", 1.0)
+        ),
+        "predictive_delta_min": float(
+            getattr(args, "predictive_delta_min", 0.05)
+        ),
+        "predictive_legacy_numerics": bool(
+            getattr(args, "predictive_legacy_numerics", False)
+        ),
         "dataset_dir": args.dataset_dir,
         "train_split_file": getattr(args, "train_split_file", ""),
         "val_split_file": getattr(args, "val_split_file", ""),
@@ -302,7 +355,7 @@ def parse_args():
         '--model-type',
         type=str,
         default='mshnet',
-        choices=['mshnet', 'full_dea', 'dea_integrated'],
+        choices=['mshnet', 'full_dea', 'dea_integrated', 'predictive_correction'],
     )
     parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--dea-lambda-single', type=float, default=0.0)
@@ -377,6 +430,18 @@ def parse_args():
     # controls in the experiment protocol.
     parser.add_argument('--integrated-route-loss-weight', type=float, default=0.0)
     parser.add_argument('--integrated-route-ramp-epochs', type=int, default=3)
+    parser.add_argument('--predictive-state-channels', type=int, default=32)
+    parser.add_argument('--predictive-step-size', type=float, default=1.0)
+    parser.add_argument('--predictive-delta-init', type=float, default=1.0)
+    parser.add_argument('--predictive-delta-min', type=float, default=0.05)
+    parser.add_argument(
+        '--predictive-legacy-numerics',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=False,
+    )
+    parser.add_argument('--predictive-log-interval', type=int, default=50)
     parser.add_argument(
         '--integrated-isolate-route-gradients',
         type=str2bool,
@@ -463,6 +528,15 @@ class Trainer(object):
                 uncertain_margin=args.integrated_uncertain_margin,
                 isolate_route_gradients=args.integrated_isolate_route_gradients,
             )
+        elif args.model_type == "predictive_correction":
+            model = PredictiveCorrectionMSHNet(
+                3,
+                state_channels=args.predictive_state_channels,
+                step_size=args.predictive_step_size,
+                delta_init=args.predictive_delta_init,
+                delta_min=args.predictive_delta_min,
+                legacy_influence_numerics=args.predictive_legacy_numerics,
+            )
         else:
             model = MSHNet(3)
 
@@ -479,6 +553,9 @@ class Trainer(object):
             if args.model_type == "dea_integrated":
                 allowed_missing = DEAIntegratedMSHNet.BASELINE_MISSING_PREFIXES
                 allowed_unexpected = DEAIntegratedMSHNet.BASELINE_UNEXPECTED_PREFIXES
+            elif args.model_type == "predictive_correction":
+                allowed_missing = PredictiveCorrectionMSHNet.BASELINE_MISSING_PREFIXES
+                allowed_unexpected = PredictiveCorrectionMSHNet.BASELINE_UNEXPECTED_PREFIXES
             elif args.model_type == "full_dea":
                 allowed_missing = ("full_dea_head.", "decidability_head.")
                 allowed_unexpected = ()
@@ -622,32 +699,47 @@ class Trainer(object):
         checkpoint,
         check_split_hashes,
     ):
-        if self.args.model_type != 'dea_integrated':
+        if self.args.model_type not in (
+            'dea_integrated',
+            'predictive_correction',
+        ):
             return
         if not isinstance(checkpoint, dict) or 'method_meta' not in checkpoint:
             raise RuntimeError(
-                'Integrated DEA resume/test requires a checkpoint containing '
+                '%s resume/test requires a checkpoint containing '
                 'method_meta; use checkpoint.pkl/checkpoint_best_iou.pkl rather '
                 'than a raw weight.pkl file.'
+                % self.args.model_type
             )
 
         metadata = checkpoint['method_meta']
         expected = get_method_metadata(self.args)
-        semantic_keys = (
-            'model_type',
-            'integrated_route_channels',
-            'integrated_route_temperature',
-            'integrated_routing_mode',
-            'integrated_decoder_routing',
-            'integrated_scale_routing',
-            'integrated_route_upsample_mode',
-            'integrated_update_limit',
-            'integrated_uncertain_margin',
-            'integrated_route_loss_weight',
-            'integrated_route_ramp_epochs',
-            'integrated_isolate_route_gradients',
-            'test_split_sha256',
-        )
+        if self.args.model_type == 'dea_integrated':
+            semantic_keys = (
+                'model_type',
+                'integrated_route_channels',
+                'integrated_route_temperature',
+                'integrated_routing_mode',
+                'integrated_decoder_routing',
+                'integrated_scale_routing',
+                'integrated_route_upsample_mode',
+                'integrated_update_limit',
+                'integrated_uncertain_margin',
+                'integrated_route_loss_weight',
+                'integrated_route_ramp_epochs',
+                'integrated_isolate_route_gradients',
+                'test_split_sha256',
+            )
+        else:
+            semantic_keys = (
+                'model_type',
+                'predictive_state_channels',
+                'predictive_step_size',
+                'predictive_delta_init',
+                'predictive_delta_min',
+                'predictive_legacy_numerics',
+                'test_split_sha256',
+            )
         if check_split_hashes:
             semantic_keys = semantic_keys + (
                 'train_split_sha256',
@@ -665,8 +757,8 @@ class Trainer(object):
                 )
         if mismatches:
             raise RuntimeError(
-                'Integrated DEA checkpoint semantics mismatch: %s'
-                % '; '.join(mismatches)
+                '%s checkpoint semantics mismatch: %s'
+                % (self.args.model_type, '; '.join(mismatches))
             )
 
     def parse_gpu_ids(self, gpu_ids):
@@ -1051,6 +1143,44 @@ class Trainer(object):
 
         torch.save(sample, osp.join(debug_dir, 'epoch_%04d_iter_%04d.pt' % (epoch, iteration)))
 
+    def predictive_correction_loss(self, state_logits, labels, epoch):
+        """Match MSHNet's effective resolution weights without duplicate heads.
+
+        MSHNet averages final, full-resolution side, half, quarter, and eighth
+        losses.  The first two together give the full-resolution prediction a
+        weight of 0.4.  The predictive decoder has only one shared readout, so
+        it applies 0.4 once to the final state and 0.2 to the preceding three
+        states.  The coarsest 1/16 state is kept as an unsupervised prefix.
+        """
+        if len(state_logits) != 5:
+            raise ValueError(
+                "predictive decoder must return five coarse-to-fine logits"
+            )
+        final_loss = self.loss_fun(
+            state_logits[4], labels, self.warm_epoch, epoch
+        )
+        if epoch <= self.warm_epoch:
+            return final_loss
+
+        labels_half = self.down(labels)
+        labels_quarter = self.down(labels_half)
+        labels_eighth = self.down(labels_quarter)
+        loss_half = self.loss_fun(
+            state_logits[3], labels_half, self.warm_epoch, epoch
+        )
+        loss_quarter = self.loss_fun(
+            state_logits[2], labels_quarter, self.warm_epoch, epoch
+        )
+        loss_eighth = self.loss_fun(
+            state_logits[1], labels_eighth, self.warm_epoch, epoch
+        )
+        return (
+            0.4 * final_loss
+            + 0.2 * loss_half
+            + 0.2 * loss_quarter
+            + 0.2 * loss_eighth
+        )
+
     def train(self, epoch):
         self.model.train()
         self.configure_full_dea_trainable(epoch)
@@ -1065,6 +1195,7 @@ class Trainer(object):
             use_dea = self.use_dea(epoch)
 
             full_dea_out = None
+            predictive_out = None
             if self.args.model_type == "full_dea":
                 out = self.model(data, tag, return_dict=True)
                 masks = out["masks"]
@@ -1075,6 +1206,20 @@ class Trainer(object):
                 out = self.model(data, tag, return_dict=True)
                 masks = out["masks"]
                 pred = out["pred"]
+                dea_out = None
+            elif self.args.model_type == "predictive_correction":
+                return_details = (
+                    self.args.predictive_log_interval > 0
+                    and i % self.args.predictive_log_interval == 0
+                )
+                predictive_out = self.model(
+                    data,
+                    tag,
+                    return_dict=True,
+                    return_details=return_details,
+                )
+                masks = []
+                pred = predictive_out["pred"]
                 dea_out = None
             elif use_dea:
                 masks, pred, dea_out = self.model(
@@ -1087,16 +1232,20 @@ class Trainer(object):
                 masks, pred = self.model(data, tag)
                 dea_out = None
 
-            loss = 0
-
-            loss = loss + self.loss_fun(pred, labels, self.warm_epoch, epoch)
-            labels_for_scale = labels
-            for j in range(len(masks)):
-                if j>0:
-                    labels_for_scale = self.down(labels_for_scale)
-                loss = loss + self.loss_fun(masks[j], labels_for_scale, self.warm_epoch, epoch)
-                
-            loss = loss / (len(masks)+1)
+            if predictive_out is not None:
+                loss = self.predictive_correction_loss(
+                    predictive_out["state_logits"], labels, epoch
+                )
+            else:
+                loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
+                labels_for_scale = labels
+                for j in range(len(masks)):
+                    if j>0:
+                        labels_for_scale = self.down(labels_for_scale)
+                    loss = loss + self.loss_fun(
+                        masks[j], labels_for_scale, self.warm_epoch, epoch
+                    )
+                loss = loss / (len(masks)+1)
             loss_seg_for_debug = loss.detach()
             integrated_route_loss = None
             integrated_route_log = {}
@@ -1241,6 +1390,20 @@ class Trainer(object):
                     ])
                     msg.extend(self.format_log_dict(integrated_route_log))
                 print('[INTEGRATED DEA] ' + ' | '.join(msg))
+
+            if (
+                predictive_out is not None
+                and "corrections" in predictive_out
+            ):
+                core_model = (
+                    self.model.module
+                    if isinstance(self.model, nn.DataParallel)
+                    else self.model
+                )
+                stats = core_model.state_statistics(predictive_out)
+                print('[PREDICTIVE CORRECTION] ' + ' | '.join(
+                    self.format_log_dict(stats)
+                ))
         
             self.optimizer.zero_grad()
             loss.backward()
@@ -1271,7 +1434,11 @@ class Trainer(object):
                 mask = mask.to(self.device, non_blocking=True)
 
                 loss = 0
-                if self.args.model_type in ("full_dea", "dea_integrated"):
+                if self.args.model_type in (
+                    "full_dea",
+                    "dea_integrated",
+                    "predictive_correction",
+                ):
                     out = self.model(data, tag, return_dict=True)
                     pred = out["pred"]
                     if route_audit is not None:

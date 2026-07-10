@@ -5,6 +5,7 @@ import sys
 from argparse import Namespace
 
 import pytest
+import torch
 import torch.nn as nn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,7 +13,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from main import Trainer, get_method_metadata, get_method_name, get_run_folder_name, validate_args
+from model.MSHNet import MSHNet
 from model.full_dea_mshnet import FullDEAMSHNet
+from model.predictive_correction_mshnet import PredictiveCorrectionMSHNet
 
 
 def make_args(**kwargs):
@@ -49,6 +52,12 @@ def make_args(**kwargs):
         integrated_route_loss_weight=0.05,
         integrated_route_ramp_epochs=3,
         integrated_isolate_route_gradients=True,
+        predictive_state_channels=32,
+        predictive_step_size=1.0,
+        predictive_delta_init=1.0,
+        predictive_delta_min=0.05,
+        predictive_legacy_numerics=False,
+        predictive_log_interval=50,
         dataset_dir="datasets/NUAA-SIRST",
         seed=20260706,
         deterministic=True,
@@ -125,6 +134,82 @@ def test_integrated_rejects_nonexclusive_hard_gate_interpolation() -> None:
     )
     with pytest.raises(ValueError, match="Hard scale routing"):
         validate_args(args)
+
+
+def test_predictive_correction_method_name_exposes_state_width() -> None:
+    args = validate_args(make_args(model_type="predictive_correction"))
+    assert get_method_name(args) == "PredictiveCorrection-C32-Eta1"
+    metadata = get_method_metadata(args)
+    assert metadata["predictive_state_channels"] == 32
+    assert metadata["predictive_step_size"] == 1.0
+    assert metadata["predictive_legacy_numerics"] is False
+
+    half_step = validate_args(make_args(
+        model_type="predictive_correction",
+        predictive_step_size=0.5,
+        predictive_legacy_numerics=True,
+    ))
+    assert get_method_name(half_step) == (
+        "PredictiveCorrection-C32-Eta0p5-LegacyNum"
+    )
+
+
+def test_predictive_checkpoint_metadata_rejects_numerics_mismatch() -> None:
+    args = validate_args(make_args(model_type="predictive_correction"))
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    metadata = get_method_metadata(args)
+
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer, {"method_meta": metadata}, check_split_hashes=False
+    )
+    incompatible = dict(metadata)
+    incompatible["predictive_legacy_numerics"] = True
+    with pytest.raises(RuntimeError, match="legacy_numerics"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": incompatible}, check_split_hashes=False
+        )
+
+
+def test_predictive_partial_load_accepts_only_replaced_decoder_keys() -> None:
+    torch.manual_seed(11)
+    baseline = MSHNet(3)
+    predictive = PredictiveCorrectionMSHNet(3, state_channels=32)
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = predictive
+
+    Trainer.load_model_state_partial(
+        trainer,
+        baseline.state_dict(),
+        allowed_missing_prefixes=PredictiveCorrectionMSHNet.BASELINE_MISSING_PREFIXES,
+        allowed_unexpected_prefixes=PredictiveCorrectionMSHNet.BASELINE_UNEXPECTED_PREFIXES,
+    )
+
+    assert torch.equal(
+        predictive.conv_init.weight, baseline.conv_init.weight
+    )
+    assert torch.equal(
+        predictive.encoder_3[1].conv2.weight,
+        baseline.encoder_3[1].conv2.weight,
+    )
+
+
+def test_predictive_correction_rejects_invalid_dynamics() -> None:
+    with pytest.raises(ValueError, match="state-channels"):
+        validate_args(make_args(
+            model_type="predictive_correction",
+            predictive_state_channels=1,
+        ))
+    with pytest.raises(ValueError, match="step-size"):
+        validate_args(make_args(
+            model_type="predictive_correction",
+            predictive_step_size=1.5,
+        ))
+    with pytest.raises(ValueError, match="delta-init"):
+        validate_args(make_args(
+            model_type="predictive_correction",
+            predictive_delta_init=0.01,
+        ))
 
 
 def test_frozen_backbone_keeps_batchnorm_statistics_fixed() -> None:
