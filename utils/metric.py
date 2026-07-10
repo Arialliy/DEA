@@ -41,12 +41,11 @@ class ROCMetric():
         return tp_rates, fp_rates, recall, precision
 
     def reset(self):
-
-        self.tp_arr   = np.zeros([11])
-        self.pos_arr  = np.zeros([11])
-        self.fp_arr   = np.zeros([11])
-        self.neg_arr  = np.zeros([11])
-        self.class_pos= np.zeros([11])
+        self.tp_arr   = np.zeros([self.bins+1])
+        self.pos_arr  = np.zeros([self.bins+1])
+        self.fp_arr   = np.zeros([self.bins+1])
+        self.neg_arr  = np.zeros([self.bins+1])
+        self.class_pos= np.zeros([self.bins+1])
 
 
 
@@ -61,51 +60,64 @@ class PD_FA():
         self.PD = np.zeros(self.bins + 1)
         self.target= np.zeros(self.bins + 1)
         self.size = size
+        # Index zero remains the official operating point used by main.py.
+        # The remaining entries form a probability sweep without duplicating
+        # the 0.5 operating point.
+        sweep = [i / self.bins for i in range(self.bins + 1)]
+        self.thresholds = [0.5] + [x for x in sweep if abs(x - 0.5) > 1e-12]
+        self.num_images = 0
+
     def update(self, preds, labels):
-        
-        for iBin in range(self.bins+1):
-            score_thresh = iBin * (255/self.bins)
-            predits  = np.array((preds > score_thresh).cpu()).astype('int64')
-            
-            predits = np.reshape(predits, (self.size, self.size))  
-            labelss = np.array((labels).cpu()).astype('int64')  
-            labelss = np.reshape(labelss, (self.size, self.size))  
+        probabilities = torch.sigmoid(preds.detach()).cpu().numpy()
+        label_array = labels.detach().cpu().numpy()
+        if probabilities.ndim == 3:
+            probabilities = probabilities[:, None, :, :]
+        if label_array.ndim == 3:
+            label_array = label_array[:, None, :, :]
 
-            image = measure.label(predits, connectivity=2)
-            coord_image = measure.regionprops(image)
-            label = measure.label(labelss , connectivity=2)
-            coord_label = measure.regionprops(label)
+        batch_size = probabilities.shape[0]
+        self.num_images += batch_size
+        for iBin, score_thresh in enumerate(self.thresholds):
+            for batch_index in range(batch_size):
+                predits = (probabilities[batch_index, 0] > score_thresh).astype(
+                    "int64"
+                )
+                labelss = (label_array[batch_index, 0] > 0.5).astype("int64")
 
-            self.target[iBin]    += len(coord_label)
-            self.image_area_total = []
-            self.image_area_match = []
-            self.distance_match   = []
-            self.dismatch         = []
+                pred_regions = list(
+                    measure.regionprops(measure.label(predits, connectivity=2))
+                )
+                label_regions = list(
+                    measure.regionprops(measure.label(labelss, connectivity=2))
+                )
+                self.target[iBin] += len(label_regions)
 
-            for K in range(len(coord_image)):
-                area_image = np.array(coord_image[K].area)
-                self.image_area_total.append(area_image)
-
-            for i in range(len(coord_label)):
-                centroid_label = np.array(list(coord_label[i].centroid))
-                for m in range(len(coord_image)):
-                    centroid_image = np.array(list(coord_image[m].centroid))
-                    distance = np.linalg.norm(centroid_image - centroid_label)
-                    area_image = np.array(coord_image[m].area)
-                    if distance < 3:
-                        self.distance_match.append(distance)
-                        self.image_area_match.append(area_image)
-
-                        del coord_image[m]
+                unmatched_predictions = list(pred_regions)
+                matched_targets = 0
+                for label_region in label_regions:
+                    if not unmatched_predictions:
                         break
+                    centroid_label = np.asarray(label_region.centroid)
+                    distances = [
+                        np.linalg.norm(
+                            np.asarray(pred_region.centroid) - centroid_label
+                        )
+                        for pred_region in unmatched_predictions
+                    ]
+                    nearest_index = int(np.argmin(distances))
+                    if distances[nearest_index] < 3:
+                        unmatched_predictions.pop(nearest_index)
+                        matched_targets += 1
 
-            self.dismatch = [x for x in self.image_area_total if x not in self.image_area_match]
-            self.FA[iBin]+=np.sum(self.dismatch)
-            self.PD[iBin]+=len(self.distance_match)
+                self.PD[iBin] += matched_targets
+                self.FA[iBin] += sum(
+                    region.area for region in unmatched_predictions
+                )
 
-    def get(self,img_num):
-
-        Final_FA =  self.FA / ((self.size*self.size) * img_num)
+    def get(self,img_num=None):
+        del img_num
+        image_count = max(1, self.num_images)
+        Final_FA =  self.FA / ((self.size*self.size) * image_count)
         Final_PD = np.divide(
             self.PD,
             self.target,
@@ -120,6 +132,7 @@ class PD_FA():
         self.FA  = np.zeros([self.bins+1])
         self.PD  = np.zeros([self.bins+1])
         self.target = np.zeros([self.bins+1])
+        self.num_images = 0
 
 class mIoU():
 

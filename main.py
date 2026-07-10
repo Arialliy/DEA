@@ -7,7 +7,11 @@ import torch.utils.data as Data
 from model.MSHNet import *
 from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
-from model.full_dea_loss import full_dea_aux_loss_v2
+from model.full_dea_loss import (
+    full_dea_aux_loss_v2,
+    full_dea_aux_loss_v3,
+    full_dea_aux_loss_v4,
+)
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -89,13 +93,33 @@ def validate_args(args):
                 raise ValueError("--%s must be in [0, 1]." % name.replace("_", "-"))
         if float(args.full_dea_topk_min_score) < 0.0:
             raise ValueError("--full-dea-topk-min-score must be non-negative.")
+        if args.full_dea_version not in ("v2", "v3", "v4", "v5"):
+            raise ValueError("--full-dea-version must be v2, v3, v4, or v5.")
+        if args.full_dea_protect_kernel <= 0 or args.full_dea_protect_kernel % 2 == 0:
+            raise ValueError("--full-dea-protect-kernel must be a positive odd integer.")
+        if args.full_dea_hard_min_area < 1:
+            raise ValueError("--full-dea-hard-min-area must be >= 1.")
+        if (
+            args.full_dea_hard_max_area > 0
+            and args.full_dea_hard_max_area < args.full_dea_hard_min_area
+        ):
+            raise ValueError(
+                "--full-dea-hard-max-area must be 0 or >= --full-dea-hard-min-area."
+            )
         if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
             raise FileNotFoundError(args.init_from_baseline)
     return args
 
 def get_method_name(args):
     if args.model_type == "full_dea":
-        return "FullDEA-v2"
+        version = getattr(args, "full_dea_version", "v3")
+        if version == "v2":
+            return "FullDEA-v2"
+        if version == "v4":
+            return "FullDEA-v4-CRR"
+        if version == "v5":
+            return "FullDEA-v5-CRR-HT"
+        return "FullDEA-v3-TPS"
     if (
         args.dea_lambda_single > 0
         or args.dea_lambda_dec > 0
@@ -114,6 +138,7 @@ def get_method_metadata(args):
     return {
         "method": get_method_name(args),
         "model_type": args.model_type,
+        "full_dea_version": getattr(args, "full_dea_version", ""),
         "init_from_baseline": args.init_from_baseline,
         "full_dea_lambda": float(args.full_dea_lambda),
         "full_dea_ramp_epochs": int(args.full_dea_ramp_epochs),
@@ -126,6 +151,9 @@ def get_method_metadata(args):
         "full_dea_topk_min_score": float(args.full_dea_topk_min_score),
         "full_dea_max_hard_bg_ratio": float(args.full_dea_max_hard_bg_ratio),
         "full_dea_safe_kernel": int(args.full_dea_safe_kernel),
+        "full_dea_protect_kernel": int(args.full_dea_protect_kernel),
+        "full_dea_hard_min_area": int(args.full_dea_hard_min_area),
+        "full_dea_hard_max_area": int(args.full_dea_hard_max_area),
         "dea_lambda_single": float(args.dea_lambda_single),
         "dea_lambda_dec": float(args.dea_lambda_dec),
         "dea_lambda_empty": float(args.dea_lambda_empty),
@@ -182,6 +210,12 @@ def parse_args():
     parser.add_argument('--paired-baseline-iou', type=float, default=0.0)
     parser.add_argument('--pd-fa-iou-margin', type=float, default=0.005)
     parser.add_argument('--full-dea-lambda', type=float, default=1.0)
+    parser.add_argument(
+        '--full-dea-version',
+        type=str,
+        default='v3',
+        choices=['v2', 'v3', 'v4', 'v5'],
+    )
     parser.add_argument('--full-dea-ramp-epochs', type=int, default=30)
     parser.add_argument('--full-dea-start-epoch', type=int, default=0)
     parser.add_argument('--full-dea-freeze-backbone-epochs', type=int, default=0)
@@ -192,6 +226,9 @@ def parse_args():
     parser.add_argument('--full-dea-topk-min-score', type=float, default=0.45)
     parser.add_argument('--full-dea-max-hard-bg-ratio', type=float, default=0.003)
     parser.add_argument('--full-dea-safe-kernel', type=int, default=15)
+    parser.add_argument('--full-dea-protect-kernel', type=int, default=9)
+    parser.add_argument('--full-dea-hard-min-area', type=int, default=1)
+    parser.add_argument('--full-dea-hard-max-area', type=int, default=256)
     parser.add_argument('--full-dea-debug', action='store_true')
 
     args = parser.parse_args()
@@ -240,7 +277,7 @@ class Trainer(object):
         torch.backends.cudnn.benchmark = not args.deterministic
 
         if args.model_type == "full_dea":
-            model = FullDEAMSHNet(3)
+            model = FullDEAMSHNet(3, full_dea_version=args.full_dea_version)
         else:
             model = MSHNet(3)
 
@@ -438,6 +475,14 @@ class Trainer(object):
             else:
                 param.requires_grad = True
 
+        if freeze:
+            for name, module in model.named_modules():
+                if name.startswith("full_dea_head"):
+                    continue
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+            model.full_dea_head.train()
+
     def format_log_dict(self, log_dict):
         msg = []
         for key, value in log_dict.items():
@@ -479,8 +524,8 @@ class Trainer(object):
         torch.save(sample, osp.join(debug_dir, 'epoch_%04d_iter_%04d.pt' % (epoch, iteration)))
 
     def train(self, epoch):
-        self.configure_full_dea_trainable(epoch)
         self.model.train()
+        self.configure_full_dea_trainable(epoch)
         tbar = tqdm(self.train_loader)
         losses = AverageMeter()
         for i, (data, mask) in enumerate(tbar):
@@ -523,20 +568,53 @@ class Trainer(object):
 
             if self.args.model_type == "full_dea" and full_dea_out is not None:
                 ramp = self.get_full_dea_ramp(epoch)
-                loss_full_dea, full_dea_log = full_dea_aux_loss_v2(
-                    full_dea_out=full_dea_out,
-                    target=labels,
-                    epoch=epoch,
-                    warm_epoch=self.warm_epoch,
-                    seg_criterion=self.loss_fun,
-                    tau_base=self.args.full_dea_tau_base,
-                    tau_target=self.args.full_dea_tau_target,
-                    tau_scale=self.args.full_dea_tau_scale,
-                    safe_kernel=self.args.full_dea_safe_kernel,
-                    topk_ratio=self.args.full_dea_topk_ratio,
-                    topk_min_score=self.args.full_dea_topk_min_score,
-                    max_hard_bg_ratio=self.args.full_dea_max_hard_bg_ratio,
-                )
+                if self.args.full_dea_version == "v2":
+                    loss_full_dea, full_dea_log = full_dea_aux_loss_v2(
+                        full_dea_out=full_dea_out,
+                        target=labels,
+                        epoch=epoch,
+                        warm_epoch=self.warm_epoch,
+                        seg_criterion=self.loss_fun,
+                        tau_base=self.args.full_dea_tau_base,
+                        tau_target=self.args.full_dea_tau_target,
+                        tau_scale=self.args.full_dea_tau_scale,
+                        safe_kernel=self.args.full_dea_safe_kernel,
+                        topk_ratio=self.args.full_dea_topk_ratio,
+                        topk_min_score=self.args.full_dea_topk_min_score,
+                        max_hard_bg_ratio=self.args.full_dea_max_hard_bg_ratio,
+                    )
+                elif self.args.full_dea_version == "v3":
+                    loss_full_dea, full_dea_log = full_dea_aux_loss_v3(
+                        full_dea_out=full_dea_out,
+                        target=labels,
+                        epoch=epoch,
+                        warm_epoch=self.warm_epoch,
+                        seg_criterion=self.loss_fun,
+                        tau_base=self.args.full_dea_tau_base,
+                        tau_target=self.args.full_dea_tau_target,
+                        tau_scale=self.args.full_dea_tau_scale,
+                        protect_kernel=self.args.full_dea_protect_kernel,
+                        safe_kernel=self.args.full_dea_safe_kernel,
+                        min_component_area=self.args.full_dea_hard_min_area,
+                        max_component_area=self.args.full_dea_hard_max_area,
+                        max_hard_bg_ratio=self.args.full_dea_max_hard_bg_ratio,
+                    )
+                else:
+                    loss_full_dea, full_dea_log = full_dea_aux_loss_v4(
+                        full_dea_out=full_dea_out,
+                        target=labels,
+                        epoch=epoch,
+                        warm_epoch=self.warm_epoch,
+                        seg_criterion=self.loss_fun,
+                        tau_base=self.args.full_dea_tau_base,
+                        tau_target=self.args.full_dea_tau_target,
+                        tau_scale=self.args.full_dea_tau_scale,
+                        protect_kernel=self.args.full_dea_protect_kernel,
+                        safe_kernel=self.args.full_dea_safe_kernel,
+                        min_component_area=self.args.full_dea_hard_min_area,
+                        max_component_area=self.args.full_dea_hard_max_area,
+                        max_hard_bg_ratio=self.args.full_dea_max_hard_bg_ratio,
+                    )
                 loss = loss + self.args.full_dea_lambda * ramp * loss_full_dea
 
                 if self.args.full_dea_debug and i % max(1, self.args.dea_debug_interval) == 0:
@@ -588,6 +666,7 @@ class Trainer(object):
         self.model.eval()
         self.mIoU.reset()
         self.PD_FA.reset()
+        self.ROC.reset()
         tbar = tqdm(self.val_loader)
         tag = False
         with torch.no_grad():

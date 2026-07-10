@@ -3,15 +3,33 @@ from __future__ import annotations
 import torch
 
 from model.MSHNet import MSHNet, ResNet
-from model.full_dea_head import FullDEAHeadV2
+from model.full_dea_head import (
+    FullDEAHeadV2,
+    FullDEAHeadV3,
+    FullDEAHeadV4,
+    FullDEAHeadV5,
+    FullDEAHeadV6,
+)
 
 
 class FullDEAMSHNet(MSHNet):
-    """MSHNet with Full DEA v2 at the multi-scale evidence fusion point."""
+    """MSHNet with Full DEA at the multi-scale evidence fusion point."""
 
-    def __init__(self, input_channels: int, block=ResNet):
+    def __init__(self, input_channels: int, block=ResNet, full_dea_version: str = "v3"):
         super().__init__(input_channels, block=block)
-        self.full_dea_head = FullDEAHeadV2(hidden_channels=32)
+        if full_dea_version == "v2":
+            self.full_dea_head = FullDEAHeadV2(hidden_channels=32)
+        elif full_dea_version == "v3":
+            self.full_dea_head = FullDEAHeadV3(hidden_channels=32)
+        elif full_dea_version == "v4":
+            self.full_dea_head = FullDEAHeadV4(hidden_channels=32)
+        elif full_dea_version == "v5":
+            self.full_dea_head = FullDEAHeadV5(hidden_channels=32)
+        elif full_dea_version == "v6":
+            self.full_dea_head = FullDEAHeadV6(hidden_channels=32)
+        else:
+            raise ValueError("Unsupported Full DEA version: %s" % full_dea_version)
+        self.full_dea_version = full_dea_version
 
     def _forward_features(self, x: torch.Tensor):
         x_e0 = self.encoder_0(self.conv_init(x))
@@ -74,14 +92,25 @@ class FullDEAMSHNet(MSHNet):
             x_d3,
         )
         z_base = self.final(scale_logits_full)
-        full_dea_out = self.full_dea_head(
-            x_d0=x_d0,
-            x_d1=x_d1,
-            x_d2=x_d2,
-            x_d3=x_d3,
-            scale_logits_full=scale_logits_full,
-            z_base=z_base,
-        )
+        head_kwargs = {
+            "x_d0": x_d0,
+            "x_d1": x_d1,
+            "x_d2": x_d2,
+            "x_d3": x_d3,
+            "scale_logits_full": scale_logits_full,
+            "z_base": z_base,
+        }
+        if self.full_dea_version in ("v3", "v4", "v5", "v6"):
+            head_kwargs.update(
+                {
+                    "fusion_weight": self.final.weight,
+                    "fusion_bias": self.final.bias,
+                    "fusion_stride": self.final.stride,
+                    "fusion_padding": self.final.padding,
+                    "fusion_dilation": self.final.dilation,
+                }
+            )
+        full_dea_out = self.full_dea_head(**head_kwargs)
         pred = full_dea_out["z_final"]
 
         if return_dict:

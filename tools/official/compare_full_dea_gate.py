@@ -41,6 +41,7 @@ def main() -> None:
     c_iou = metric(candidate, "IoU")
     c_pd = metric(candidate, "PD")
     c_fa = metric(candidate, "FA")
+    method = candidate.get("method", "FullDEA")
 
     main_gate = {
         "IoU": c_iou >= args.iou_min,
@@ -82,9 +83,9 @@ def main() -> None:
             else "FULL_DEA_NUAA_FIRST_GATE_FAIL"
         ),
         "interpretation": (
-            "FullDEA-v2 passes the declared NUAA first gate for this checkpoint."
+            f"{method} passes the declared NUAA first gate for this checkpoint."
             if gate_pass
-            else "FullDEA-v2 fails at least one declared NUAA first-gate condition for this checkpoint."
+            else f"{method} fails at least one declared NUAA first-gate condition for this checkpoint."
         ),
     }
 
