@@ -529,9 +529,236 @@ neither:                             53
 受到 dynamic scale fusion、multiple-choice learning 和 online self-distillation
 先例约束。主问题转向 side prediction 之前的 representation/optimization。
 
-下一硬门是只读 feature-level audit：用 fit/calibration/evaluation 严格隔离的
-冻结线性 probe 或带 null control 的统一统计，定位 no-response GT 在
-encoder/decoder path 上首次失去 target-versus-local-background 可分性。若 latent
-feature 仍可分而 side logit 不可分，才允许研究单一 path-wise survival risk；
-若 latent feature 很早就不可分，则 loss-only 路线也应 NO-GO。该门完成前不增加
-网络模块、不设计复合 loss、不启动新方法训练。
+下一硬门是只读 feature-level audit：用带 geometry-matched null control 的统一
+统计，定位 no-response GT 在 encoder/decoder path 上何处出现或丢失
+target-versus-local-background 区分度。该门只做方向筛选，不增加网络模块、
+不设计复合 loss、不启动新方法训练。
+
+## 11. Feature-survival audit
+
+### 11.1 协议与解释边界
+
+九个冻结 checkpoint 均在原 internal validation 上执行一次原生 MSHNet warm
+forward。临时 hooks 只读取以下真实 DAG 张量，不重写 forward，也不以重建结果
+替代 direct prediction：
+
+```text
+input -> stem -> e0 -> p0 -> e1 -> p1 -> e2 -> p2 -> e3 -> p3 -> m
+      -> j3 -> d3 -> j2 -> d2 -> j1 -> d1 -> j0 -> d0
+      -> native masks / full sides / exact contributions -> final z
+```
+
+对每个 GT component，在每个空间尺度使用 area projection 保留 fractional
+occupancy；在排除所有 GT 及 3-pixel guard 后，生成 64 个同形状平移
+pseudo-target。主统计是 target 相对其局部背景的逐通道 robust-standardized
+contrast norm，再以 64 个 geometry-matched null scores 做 rank calibration：
+
+```text
+distinct:        rank >= 0.95
+background-like: rank <= 0.50
+uncertain:       otherwise
+undefined:       geometry/background controls insufficient
+```
+
+这是无方向的 GT-conditioned 探索性统计，不是线性可分性证明、可部署分类器、
+模型性能或因果归因。对 scalar logits 另报 `AUC+ = P(z_target > z_background)`
+和 target peak 到固定阈值 0 的 margin，以区分正确方向、反向响应和仅低于阈值。
+
+审计 cohort 固定为前述 71 个 `p=0.5` final no-response paired observations，
+并从每个 checkpoint 的 matched GT 中按面积/边界距离选取 71 个对照。完整结果：
+
+```text
+repro_runs/ccsr_gate_c1/*_feature_survival.json
+repro_runs/ccsr_gate_c1/summary_feature_survival_p050.json
+repro_runs/ccsr_gate_c1/summary_feature_survival_p050.md
+```
+
+### 11.2 主要结果
+
+| Dataset | No-response | Input distinct | Middle distinct | D0 distinct | Any native side distinct | Mask0 distinct | Final distinct | Final AUC+ > 0.5 | D0→final drop | Matched D0/final distinct |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| IRSTD-1K | 48 | 42 | 25/45 | 44 | 41 | 27 | 29 | 28 | 16 | 47/48 |
+| NUAA-SIRST | 3 | 3 | 3/3 | 3 | 3 | 2 | 2 | 3 | 1 | 3/3 |
+| NUDT-SIRST | 20 | 13 | 10/20 | 18 | 15 | 4 | 4 | 17 | 14 | 20/20 |
+| **All** | **71** | **58** | **38/68** | **65** | **59** | **33** | **35** | **48** | **31** | **70/71** |
+
+补充事实：
+
+- 任一 decoder output distinct：`68/71`；D0 distinct：`65/71 = 91.55%`；
+- 任一 native side logit distinct：`59/71 = 83.10%`，任一 native side
+  `AUC+ > 0.5`：`62/71`；
+- `d0 distinct -> mask0 non-distinct` 有 33 个，反向 recovery 仅 1 个；
+- final `z` distinct：`35/71 = 49.30%`，但 `AUC+ > 0.5` 有
+  `48/71 = 67.61%`；
+- final `z` target peak margin 对 71 个目标全部小于 0；其
+  `min / median / max = -63.28 / -29.28 / -0.515`；
+- area/border-matched 正对照中，D0 distinct `70/71`、final distinct
+  `71/71`。
+
+### 11.3 修正后的机制判断
+
+多尺度 threshold audit 中“65/71 raw sides 全缺失”不能再解释为 latent
+information 已经消失。训练-free audit 显示，多数 no-response 目标在 late
+decoder feature 中仍是局部异常，部分 scalar side/final logits 也保留正确方向的
+相对排序；失败主要表现为 readout 后区分度降低、响应反向，或绝对 logit 远低于
+固定阈值。Middle 只有 `38/68` distinct，而 D0 回升到 `65/71`，说明 skip path
+存在大量 recovery；不能把单个最早 drop edge 解释成因果瓶颈。
+
+同时必须保留三项限制：
+
+1. raw input 本身已有 `58/71` distinct，故无方向统计可能捕获局部亮度/纹理，
+   不能直接等同于 target semantics；
+2. `distinct` 不提供可部署方向，只有 scalar `AUC+` 与 fixed-threshold margin
+   能说明读出方向和校准；
+3. best-IoU checkpoint 由同一 internal validation 选择，本审计又在该 split 上
+   定义 cohort 和解释特征，因此只能用于探索性方向筛选。方法一旦确定，必须在
+   新冻结 development split 上做确认，official test 仍不能提前读取。
+
+当前允许进入的只剩理论/先例门：检查能否定义一个**单一的 path-wise
+fixed-threshold survival/calibration risk**，约束 target-local-background 的正确
+方向与背景 FA budget，同时不新增 head、selector 或 inference branch。若它退化
+为 per-layer loss 求和、MIL/max pooling、hard-positive weighting、ordinary ranking
+或 deep supervision，则继续 NO-GO；在该门通过前仍不启动训练。
+
+## 12. Path-wise survival 的数学与先例门
+
+### 12.1 Weakest-side 与 best-side 都发生精确退化
+
+令第 `s` 个 side 对实例 `k` 的 bag margin 为：
+
+\[
+m_{ks}=\max_{u\in A_{ks}}a_s(u)-\tau_s-\gamma_s.
+\]
+
+若所谓 path survival 是所有 side 的最弱 margin，则对任意单调 hinge：
+
+\[
+[-\min_s m_{ks}]_+=\max_s[-m_{ks}]_+.
+\]
+
+它严格等于“每实例 max-pooling MIL + worst-head/OHEM”，只是把 canonical
+deep-supervision 的均值改成最大值。若改用 best side：
+
+\[
+[ -\max_s m_{ks}]_+=\min_s[-m_{ks}]_+,
+\]
+
+则退化为 latent best-expert/max-MIL；再要求 final 模仿 best side，就是已有
+self-distillation/learned fusion 的变体。用路径概率乘积也不能避免：取负对数后
+重新变成逐阶段损失求和，并额外假设阶段独立。
+
+真实记录也不支持 weakest-side：
+
+```text
+any side AUC+ > 0.5:        62 / 71
+all four sides AUC+ > 0.5:  27 / 71
+all four sides distinct:    17 / 71
+any side target peak > 0:    4 / 71
+all side target peaks > 0:   0 / 71
+```
+
+Middle 的低 distinctness 又可被 skip path 恢复，因此强制所有阶段越阈值会惩罚
+大量最终函数不需要的内部状态。
+
+### 12.2 Raw side logits 不是可识别的路径证书
+
+MSHNet final readout 满足：
+
+\[
+z=b+\sum_s K_s*a_s.
+\]
+
+对任意非零常数 `c_s`，变换：
+
+\[
+a'_s=c_sa_s,\qquad K'_s=K_s/c_s
+\]
+
+保持 deployed `z` 完全不变；`c_s<0` 甚至会翻转某个 side 的符号。因此跨 raw
+side 比较 margin、阈值或“最弱阶段”不是 final function 的可识别属性。Canonical
+side loss 可以人为固定 gauge，但新 path term 随即成为另一个辅助 loss。
+
+使用精确 contributions `c_s=K_s*a_s` 可消除该 gauge，却暴露另一问题：它们是
+并行加和项，不是依次必须存活的 stages。GT-conditioned 14-subset oracle 只恢复
+`15/71`，不能支撑一个覆盖主错误的 contribution path 方法。
+
+### 12.3 唯一干净 reference 仍是已知目标的闭包
+
+删除不可信的内部 path 后，剩下的 output-only 参考式是：
+
+\[
+\boxed{
+\mathcal L_\infty^{out}=
+\max\left\{
+\max_k[\tau+\gamma_+-\max_{u\in A_k}z(u)]_+,\;
+[z^{\mathcal B}_{[B+1]}-(\tau-\gamma_-)]_+
+\right\}.
+}
+\]
+
+其中 `B` 是允许越阈值的 safe-background pixels 数，`z_[B+1]` 是背景第
+`B+1` 大 logit。正 margin `gamma_+>0` 是必要的；推理使用 strict `z>tau`，若
+margin 为 0，则 `z=tau` 会得到零 loss 却仍判为背景。空目标图只保留背景项；
+`B` 覆盖全部背景时背景项为 0。
+
+该式只是以下已知元素的 `L_inf` 聚合：
+
+- per-instance max-pooling MIL existence；
+- instance/head OHEM 或 worst-group scalarization；
+- background exact top-k/order statistic；
+- fixed type-I-error budget 下的 Neyman–Pearson learning。
+
+精确负对照已实现于：
+
+```text
+model/operating_point_mil_reference.py
+tests/test_operating_point_mil_reference.py
+```
+
+它不接 `main.py`，不作为方法。测试显式展示两个零损失退化：每个大 GT 只保留
+一个正 pixel 时 IoU 可低至 `1/|G|`；允许一个 bridge background pixel 时，两个
+GT 可连成一个 component，one-to-one Pd 最多为 `1/2`。
+
+### 12.4 直接先例使 output/readout 路线失去主创新空间
+
+最直接的并发工作是 2026-07-02 的 **AC-SLSIoU**：同样以 MSHNet 为
+baseline，其 Eq. 6 已用 Softplus 做 target-logit 对 OHNM hard-negative-logit
+的 margin ranking，Eq. 10–11 又对超过固定置信阈值的背景使用 FA focal：
+
+https://arxiv.org/html/2607.01555
+
+此外：
+
+- TDA Loss 已做逐目标 local patch、scale/local-contrast adaptive weighting；
+  https://arxiv.org/html/2506.01349
+- REEM 已在相同 MSHNet 上用 GT local SCR 重权困难目标且不改推理；
+  https://openaccess.thecvf.com/content/CVPR2026W/PBVS/papers/Sevim_SCR-Guided_Difficulty-Aware_Optimization_for_Infrared_Small_Target_Detection_CVPRW_2026_paper.pdf
+- MSHNet、Deeply-Supervised Nets 与 HED 已覆盖 side supervision 和 learned
+  fusion；
+- strict Neyman–Pearson、partial-AUC/DRO、OHEM 与 differentiable top-k 已覆盖
+  fixed-FA constraint 和 hardest negatives。
+
+因此不能声称“首次实例局部 loss”“首次 logit target-background margin”“首次
+低 FA 学习”“首次跨尺度生存”或“首次不增加推理模块改善弱目标”。
+
+### 12.5 最终判定
+
+全局 operating threshold 的现有 `p=0.1...0.9` sweep 中，no-response 始终为
+`68...71`；简单阈值变化不能修复主错误。`p=0.8` 虽在 paired aggregate 上相对
+`p=0.5` 多 1 个 match 且 unmatched area 更低，但 no-response 仍为 71，说明
+它只改变边缘 assignment/FA，不改变主病灶。Contribution-subset oracle 的上界又
+只有 `15/71`。
+
+```text
+weakest-side/path survival as top-tier method: NO-GO
+best-side selector/distillation: NO-GO
+output-only target/background margin as main novelty: NO-GO
+operating-point MIL reference: retain as negative control only
+new path/from-scratch training: NOT AUTHORIZED
+```
+
+当前最可信的新发现只是：MSHNet 在 D0 对多数 missed targets 仍保留无方向局部
+区分度，但原生 readout 与 fixed operating point 出现系统性坍缩。这是机制诊断，
+不是论文方法。下一次方法探索前，必须先把 AC-SLSIoU、TDA、REEM、output-only
+NP/pAUC 和 HED-style learned fusion 当强对照；只在它们训练完成后的**残余错误**
+呈现新的、稳定的 component mechanism 时，才重新立题。

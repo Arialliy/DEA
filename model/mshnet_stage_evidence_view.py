@@ -167,6 +167,20 @@ def forward_mshnet_stage_evidence(
         "native_sides": native_sides,
         "full_sides": full_sides,
         "contributions": contributions,
+        "side_heads": {
+            "mask%d" % index: {
+                "weight": getattr(model, "output_%d" % index).weight,
+                "bias": getattr(model, "output_%d" % index).bias,
+            }
+            for index in range(4)
+        },
+        "final_head": {
+            "weight": model.final.weight,
+            "bias": model.final.bias,
+            "stride": model.final.stride,
+            "padding": model.final.padding,
+            "dilation": model.final.dilation,
+        },
         "fusion_bias": base["fusion_bias"],
         "z_reconstructed": base["z_reconstructed"],
     }

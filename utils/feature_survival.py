@@ -21,6 +21,52 @@ class TranslationControlSet:
     sample_key: str
 
 
+CONTEXT_DESCRIPTOR_NAMES = (
+    "median",
+    "mad",
+    "gradient_energy",
+    "laplacian_energy",
+    "entropy",
+)
+
+
+@dataclass(frozen=True)
+class ContextControlMatch:
+    """One selected context control with an auditable ranking record."""
+
+    source_index: int
+    component_mask: np.ndarray
+    mask_digest: str
+    descriptor: tuple[float, ...]
+    mahalanobis_distance: float
+    ring_pixels: int
+    stencil_pixels: int
+    ring_coverage: float
+
+
+@dataclass(frozen=True)
+class ContextMatchedControlSelection:
+    """Fail-closed result of target-exterior context matching."""
+
+    available: bool
+    reason: str | None
+    control_set: TranslationControlSet | None
+    descriptor_names: tuple[str, ...]
+    target_descriptor: tuple[float, ...] | None
+    descriptor_center: tuple[float, ...] | None
+    descriptor_scale: tuple[float, ...] | None
+    active_descriptor_mask: tuple[bool, ...] | None
+    regularized_covariance: np.ndarray | None
+    covariance_condition_number: float | None
+    context_distance_caliper: float | None
+    target_ring_pixels: int
+    target_stencil_pixels: int
+    target_ring_coverage: float | None
+    eligible_candidate_count: int
+    selected: tuple[ContextControlMatch, ...]
+    rejected_candidate_counts: tuple[tuple[str, int], ...]
+
+
 @dataclass(frozen=True)
 class ProjectedFootprint:
     occupancy: np.ndarray
@@ -146,6 +192,607 @@ def build_translation_control_set(
         guarded_target_mask=guarded_targets,
         translated_masks=tuple(translated),
         sample_key=sample_key,
+    )
+
+
+@dataclass(frozen=True)
+class _ContextRingStatistics:
+    descriptor_without_entropy: tuple[float, float, float, float]
+    values: np.ndarray
+    ring_pixels: int
+    stencil_pixels: int
+    coverage: float
+
+
+def _context_ring_statistics(
+    image: np.ndarray,
+    footprint: np.ndarray,
+    protection_mask: np.ndarray,
+    *,
+    inner_radius: float,
+    ring_width: float,
+    minimum_ring_pixels: int,
+    minimum_stencil_pixels: int,
+    minimum_ring_coverage: float,
+) -> _ContextRingStatistics | None:
+    """Measure context without accessing the footprint or protected pixels."""
+
+    distance = distance_transform_edt(~footprint)
+    geometric_ring = (distance > inner_radius) & (
+        distance <= inner_radius + ring_width
+    )
+    geometric_count = int(geometric_ring.sum())
+    if geometric_count == 0:
+        return None
+    ring = geometric_ring & ~footprint & ~protection_mask
+    ring_count = int(ring.sum())
+    coverage = ring_count / geometric_count
+    if ring_count < minimum_ring_pixels or coverage < minimum_ring_coverage:
+        return None
+
+    # Central differences and the four-neighbour Laplacian are evaluated only
+    # where their complete stencils are exterior to both the footprint and the
+    # protection mask. This makes the result invariant to every protected
+    # intensity, including the target itself.
+    exterior = ~footprint & ~protection_mask
+    stencil = np.zeros_like(exterior)
+    stencil[1:-1, 1:-1] = (
+        ring[1:-1, 1:-1]
+        & exterior[:-2, 1:-1]
+        & exterior[2:, 1:-1]
+        & exterior[1:-1, :-2]
+        & exterior[1:-1, 2:]
+    )
+    coordinates = np.argwhere(stencil)
+    if coordinates.shape[0] < minimum_stencil_pixels:
+        return None
+    rows = coordinates[:, 0]
+    columns = coordinates[:, 1]
+    center_values = image[rows, columns]
+    north = image[rows - 1, columns]
+    south = image[rows + 1, columns]
+    west = image[rows, columns - 1]
+    east = image[rows, columns + 1]
+    gradient_y = 0.5 * (south - north)
+    gradient_x = 0.5 * (east - west)
+    laplacian = north + south + west + east - 4.0 * center_values
+
+    values = image[ring].astype(np.float64, copy=True)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    gradient_energy = float(np.mean(gradient_x**2 + gradient_y**2))
+    laplacian_energy = float(np.mean(laplacian**2))
+    statistics = np.asarray(
+        (median, mad, gradient_energy, laplacian_energy),
+        dtype=np.float64,
+    )
+    if not np.isfinite(statistics).all():
+        raise RuntimeError("context descriptor produced non-finite statistics")
+    return _ContextRingStatistics(
+        descriptor_without_entropy=tuple(float(value) for value in statistics),
+        values=values,
+        ring_pixels=ring_count,
+        stencil_pixels=int(coordinates.shape[0]),
+        coverage=float(coverage),
+    )
+
+
+def _histogram_entropy(
+    values: np.ndarray,
+    *,
+    lower: float,
+    upper: float,
+    bins: int,
+) -> float:
+    if not upper > lower:
+        return 0.0
+    clipped = np.clip(values, lower, upper)
+    counts = np.histogram(clipped, bins=bins, range=(lower, upper))[0]
+    probabilities = counts[counts > 0].astype(np.float64)
+    probabilities /= probabilities.sum()
+    entropy = -np.sum(probabilities * np.log(probabilities)) / math.log(bins)
+    return float(entropy)
+
+
+def _context_mask_digest(mask: np.ndarray, *, selection_key: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(selection_key.encode("utf-8"))
+    digest.update(b"\0context-control-v1\0")
+    digest.update(np.asarray(mask.shape, dtype=np.int64).tobytes())
+    digest.update(np.packbits(mask.reshape(-1)).tobytes())
+    return digest.hexdigest()
+
+
+def _is_exact_translation(reference: np.ndarray, candidate: np.ndarray) -> bool:
+    """Return whether ``candidate`` is a rigid integer translation of ``reference``."""
+
+    reference_coordinates = np.argwhere(reference)
+    candidate_coordinates = np.argwhere(candidate)
+    if reference_coordinates.shape != candidate_coordinates.shape:
+        return False
+    offsets = candidate_coordinates - reference_coordinates
+    return bool(np.all(offsets == offsets[0]))
+
+
+def select_context_matched_controls(
+    image,
+    controls: TranslationControlSet,
+    *,
+    protection_mask=None,
+    context_inner_radius: float = 3.0,
+    context_ring_width: float = 8.0,
+    num_controls: int = 64,
+    minimum_ring_pixels: int = 32,
+    minimum_stencil_pixels: int = 16,
+    minimum_ring_coverage: float = 0.8,
+    histogram_bins: int = 16,
+    covariance_shrinkage: float = 0.2,
+    covariance_eigenvalue_floor: float = 1e-6,
+    maximum_covariance_condition: float = 1e8,
+    minimum_covariance_candidates: int = 12,
+    candidate_support_quantile: float = 0.95,
+    maximum_selected_iou: float = 0.0,
+) -> ContextMatchedControlSelection:
+    """Select deterministic context-matched same-shape background controls.
+
+    Only rings exterior to the target/control footprint and to every protected
+    pixel contribute to the descriptors. Descriptor location and scale are
+    estimated from eligible background candidates only. A shrunk, eigenvalue-
+    floored covariance defines the Mahalanobis ranking. The target footprint's
+    intensities cannot affect candidate eligibility, descriptors, scaling, or
+    ranking.
+
+    The returned selection is separate from ``controls`` so callers can retain
+    the original geometry-control cohort alongside this matched subset.
+    """
+
+    array = np.asarray(image, dtype=np.float64)
+    if array.ndim != 2 or not array.size:
+        raise ValueError("image must be a non-empty 2-D array")
+    if not np.isfinite(array).all():
+        raise ValueError("image must contain only finite values")
+    if not isinstance(controls, TranslationControlSet):
+        raise TypeError("controls must be a TranslationControlSet")
+
+    component = _binary_mask(controls.component_mask, name="component_mask")
+    all_targets = _binary_mask(controls.all_target_mask, name="all_target_mask")
+    guarded_targets = _binary_mask(
+        controls.guarded_target_mask,
+        name="guarded_target_mask",
+    )
+    if not (
+        component.shape
+        == all_targets.shape
+        == guarded_targets.shape
+        == array.shape
+    ):
+        raise ValueError("image and control masks must share a shape")
+    if not component.any() or np.any(component & ~all_targets):
+        raise ValueError("component must be a non-empty subset of all targets")
+    if np.any(all_targets & ~guarded_targets):
+        raise ValueError("guarded target mask must protect every target pixel")
+    if not isinstance(controls.sample_key, str) or not controls.sample_key:
+        raise ValueError("control sample_key must be a non-empty string")
+
+    if protection_mask is None:
+        protection = guarded_targets.copy()
+    else:
+        protection = _binary_mask(protection_mask, name="protection_mask")
+        if protection.shape != array.shape:
+            raise ValueError("protection mask and image must share a shape")
+        if np.any(all_targets & ~protection):
+            raise ValueError("protection mask must include every target pixel")
+        protection = protection | guarded_targets
+
+    radii = (context_inner_radius, context_ring_width)
+    if any(not math.isfinite(float(value)) or float(value) < 0 for value in radii):
+        raise ValueError("context radii must be finite and non-negative")
+    if context_ring_width <= 0:
+        raise ValueError("context_ring_width must be positive")
+    integer_parameters = (
+        ("num_controls", num_controls, 1),
+        ("minimum_ring_pixels", minimum_ring_pixels, 2),
+        ("minimum_stencil_pixels", minimum_stencil_pixels, 1),
+        ("histogram_bins", histogram_bins, 2),
+        ("minimum_covariance_candidates", minimum_covariance_candidates, 2),
+    )
+    for name, value, minimum in integer_parameters:
+        if not isinstance(value, int) or value < minimum:
+            raise ValueError("%s must be an integer >= %d" % (name, minimum))
+    if not 0 < minimum_ring_coverage <= 1:
+        raise ValueError("minimum_ring_coverage must lie in (0,1]")
+    if not 0 < covariance_shrinkage <= 1:
+        raise ValueError("covariance_shrinkage must lie in (0,1]")
+    if (
+        not math.isfinite(float(covariance_eigenvalue_floor))
+        or covariance_eigenvalue_floor <= 0
+    ):
+        raise ValueError("covariance_eigenvalue_floor must be finite and positive")
+    if (
+        not math.isfinite(float(maximum_covariance_condition))
+        or maximum_covariance_condition <= 1
+    ):
+        raise ValueError("maximum_covariance_condition must be finite and > 1")
+    if not 0 <= maximum_selected_iou < 1:
+        raise ValueError("maximum_selected_iou must lie in [0,1)")
+    if not 0.5 <= candidate_support_quantile < 1:
+        raise ValueError("candidate_support_quantile must lie in [0.5,1)")
+
+    rejection_counts: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    def unavailable(
+        reason: str,
+        *,
+        target_statistics: _ContextRingStatistics | None = None,
+        eligible_count: int = 0,
+        target_descriptor: tuple[float, ...] | None = None,
+        center: np.ndarray | None = None,
+        scale: np.ndarray | None = None,
+        active: np.ndarray | None = None,
+        covariance: np.ndarray | None = None,
+        condition: float | None = None,
+        caliper: float | None = None,
+    ) -> ContextMatchedControlSelection:
+        return ContextMatchedControlSelection(
+            available=False,
+            reason=reason,
+            control_set=None,
+            descriptor_names=CONTEXT_DESCRIPTOR_NAMES,
+            target_descriptor=target_descriptor,
+            descriptor_center=(
+                tuple(float(value) for value in center) if center is not None else None
+            ),
+            descriptor_scale=(
+                tuple(float(value) for value in scale) if scale is not None else None
+            ),
+            active_descriptor_mask=(
+                tuple(bool(value) for value in active) if active is not None else None
+            ),
+            regularized_covariance=(
+                covariance.copy() if covariance is not None else None
+            ),
+            covariance_condition_number=condition,
+            context_distance_caliper=caliper,
+            target_ring_pixels=(
+                target_statistics.ring_pixels if target_statistics is not None else 0
+            ),
+            target_stencil_pixels=(
+                target_statistics.stencil_pixels if target_statistics is not None else 0
+            ),
+            target_ring_coverage=(
+                target_statistics.coverage if target_statistics is not None else None
+            ),
+            eligible_candidate_count=eligible_count,
+            selected=(),
+            rejected_candidate_counts=tuple(sorted(rejection_counts.items())),
+        )
+
+    target_statistics = _context_ring_statistics(
+        array,
+        component,
+        protection,
+        inner_radius=float(context_inner_radius),
+        ring_width=float(context_ring_width),
+        minimum_ring_pixels=minimum_ring_pixels,
+        minimum_stencil_pixels=minimum_stencil_pixels,
+        minimum_ring_coverage=float(minimum_ring_coverage),
+    )
+    if target_statistics is None:
+        return unavailable("insufficient_target_exterior_context")
+
+    candidates = []
+    seen_digests = set()
+    for source_index, raw_candidate in enumerate(controls.translated_masks):
+        candidate = _binary_mask(raw_candidate, name="candidate_control")
+        if candidate.shape != array.shape:
+            raise ValueError("candidate controls and image must share a shape")
+        # TranslationControlSet is intentionally a plain data carrier. Validate
+        # its masks here as well, so a hand-built or deserialized set cannot
+        # silently turn a same-area deformation into a geometry control.
+        if not _is_exact_translation(component, candidate):
+            reject("geometry_mismatch")
+            continue
+        if np.any(candidate & protection):
+            reject("protection_overlap")
+            continue
+        digest = _context_mask_digest(candidate, selection_key=controls.sample_key)
+        if digest in seen_digests:
+            reject("duplicate_mask")
+            continue
+        seen_digests.add(digest)
+        statistics = _context_ring_statistics(
+            array,
+            candidate,
+            protection,
+            inner_radius=float(context_inner_radius),
+            ring_width=float(context_ring_width),
+            minimum_ring_pixels=minimum_ring_pixels,
+            minimum_stencil_pixels=minimum_stencil_pixels,
+            minimum_ring_coverage=float(minimum_ring_coverage),
+        )
+        if statistics is None:
+            reject("insufficient_exterior_context")
+            continue
+        candidates.append((source_index, candidate.copy(), digest, statistics))
+
+    required_candidates = max(num_controls, minimum_covariance_candidates)
+    if len(candidates) < required_candidates:
+        return unavailable(
+            "insufficient_eligible_context_controls",
+            target_statistics=target_statistics,
+            eligible_count=len(candidates),
+        )
+
+    # Entropy uses common candidate-only bin edges. Neither the target footprint
+    # nor its exterior ring can alter the quantizer fitted to background controls.
+    candidate_context_values = np.concatenate(
+        [item[3].values for item in candidates]
+    )
+    entropy_lower, entropy_upper = np.quantile(
+        candidate_context_values,
+        (0.005, 0.995),
+    )
+
+    def descriptor(statistics: _ContextRingStatistics) -> tuple[float, ...]:
+        entropy = _histogram_entropy(
+            statistics.values,
+            lower=float(entropy_lower),
+            upper=float(entropy_upper),
+            bins=histogram_bins,
+        )
+        return (*statistics.descriptor_without_entropy, entropy)
+
+    target_descriptor = descriptor(target_statistics)
+    candidate_descriptors = np.asarray(
+        [descriptor(item[3]) for item in candidates],
+        dtype=np.float64,
+    )
+    target_descriptor_array = np.asarray(target_descriptor, dtype=np.float64)
+    if not (
+        np.isfinite(candidate_descriptors).all()
+        and np.isfinite(target_descriptor_array).all()
+    ):
+        raise RuntimeError("context descriptors must be finite")
+
+    # Robust per-descriptor scaling prevents intensity, gradient, Laplacian and
+    # entropy units from defining the ranking. Candidate-only scaling prevents
+    # the target context from setting its own distance metric.
+    descriptor_center = np.median(candidate_descriptors, axis=0)
+    deviations = candidate_descriptors - descriptor_center[None, :]
+    absolute_deviations = np.abs(deviations)
+    mad_scale = 1.4826 * np.median(absolute_deviations, axis=0)
+    lower_quartile, upper_quartile = np.quantile(
+        candidate_descriptors,
+        (0.25, 0.75),
+        axis=0,
+    )
+    iqr_scale = (upper_quartile - lower_quartile) / 1.349
+    lower_decile, upper_decile = np.quantile(
+        candidate_descriptors,
+        (0.1, 0.9),
+        axis=0,
+    )
+    central_eighty_scale = (upper_decile - lower_decile) / 2.563
+    # All fallbacks remain quantile based. A rare extreme candidate therefore
+    # cannot activate an otherwise unidentified descriptor dimension or set
+    # the normalization scale through an unbounded RMS estimate.
+    scale_signal = np.maximum.reduce(
+        (mad_scale, iqr_scale, central_eighty_scale)
+    )
+    maximum_magnitude = np.maximum(
+        np.max(np.abs(candidate_descriptors), axis=0),
+        np.abs(descriptor_center),
+    )
+    numeric_tolerance = 256.0 * np.finfo(np.float64).eps * np.maximum(
+        maximum_magnitude,
+        np.finfo(np.float64).tiny,
+    )
+    active_descriptors = scale_signal > numeric_tolerance
+    inactive_target_delta = np.abs(
+        target_descriptor_array - descriptor_center
+    ) > numeric_tolerance
+    if np.any(inactive_target_delta & ~active_descriptors):
+        return unavailable(
+            "unidentified_descriptor_scale",
+            target_statistics=target_statistics,
+            eligible_count=len(candidates),
+            target_descriptor=target_descriptor,
+            center=descriptor_center,
+            active=active_descriptors,
+        )
+    descriptor_scale = np.where(active_descriptors, scale_signal, 1.0)
+    standardized_candidates = deviations / descriptor_scale[None, :]
+    standardized_target = (
+        target_descriptor_array - descriptor_center
+    ) / descriptor_scale
+    standardized_candidates[:, ~active_descriptors] = 0.0
+    standardized_target[~active_descriptors] = 0.0
+
+    covariance = np.cov(
+        standardized_candidates,
+        rowvar=False,
+        ddof=1,
+    )
+    covariance = np.atleast_2d(np.asarray(covariance, dtype=np.float64))
+    descriptor_count = len(CONTEXT_DESCRIPTOR_NAMES)
+    if covariance.shape != (descriptor_count, descriptor_count):
+        raise RuntimeError("context covariance has an unexpected shape")
+    covariance = 0.5 * (covariance + covariance.T)
+    regularized = (
+        (1.0 - covariance_shrinkage) * covariance
+        + covariance_shrinkage * np.eye(descriptor_count, dtype=np.float64)
+    )
+    eigenvalues, eigenvectors = np.linalg.eigh(regularized)
+    eigenvalues = np.maximum(eigenvalues, covariance_eigenvalue_floor)
+    regularized = (eigenvectors * eigenvalues[None, :]) @ eigenvectors.T
+    regularized = 0.5 * (regularized + regularized.T)
+    condition_number = float(eigenvalues.max() / eigenvalues.min())
+    if (
+        not np.isfinite(regularized).all()
+        or not math.isfinite(condition_number)
+        or condition_number > maximum_covariance_condition
+    ):
+        return unavailable(
+            "ill_conditioned_context_covariance",
+            target_statistics=target_statistics,
+            eligible_count=len(candidates),
+            target_descriptor=target_descriptor,
+            center=descriptor_center,
+            scale=descriptor_scale,
+            active=active_descriptors,
+            covariance=regularized,
+            condition=condition_number,
+        )
+    inverse_covariance = (
+        eigenvectors * (1.0 / eigenvalues)[None, :]
+    ) @ eigenvectors.T
+
+    # A target must lie inside background descriptor support; merely returning
+    # the least-bad controls would silently call an unmatched context "matched".
+    # The caliper is the requested-control-count nearest-neighbour radius among
+    # background candidates, evaluated at a conservative candidate quantile.
+    pairwise_difference = (
+        standardized_candidates[:, None, :]
+        - standardized_candidates[None, :, :]
+    )
+    pairwise_squared_distance = np.einsum(
+        "...i,ij,...j->...",
+        pairwise_difference,
+        inverse_covariance,
+        pairwise_difference,
+    )
+    pairwise_squared_distance = np.maximum(pairwise_squared_distance, 0.0)
+    np.fill_diagonal(pairwise_squared_distance, np.inf)
+    support_neighbour = min(num_controls, len(candidates) - 1)
+    candidate_support_radii = np.sqrt(
+        np.partition(
+            pairwise_squared_distance,
+            support_neighbour - 1,
+            axis=1,
+        )[:, support_neighbour - 1]
+    )
+    context_distance_caliper = float(
+        np.quantile(candidate_support_radii, candidate_support_quantile)
+    )
+    if not math.isfinite(context_distance_caliper):
+        return unavailable(
+            "unidentified_candidate_context_support",
+            target_statistics=target_statistics,
+            eligible_count=len(candidates),
+            target_descriptor=target_descriptor,
+            center=descriptor_center,
+            scale=descriptor_scale,
+            active=active_descriptors,
+            covariance=regularized,
+            condition=condition_number,
+        )
+
+    ranked = []
+    for item, candidate_descriptor, standardized in zip(
+        candidates,
+        candidate_descriptors,
+        standardized_candidates,
+    ):
+        difference = standardized - standardized_target
+        squared_distance = float(
+            difference @ inverse_covariance @ difference
+        )
+        if squared_distance < 0 and squared_distance > -1e-10:
+            squared_distance = 0.0
+        if squared_distance < 0 or not math.isfinite(squared_distance):
+            raise RuntimeError("Mahalanobis distance must be finite and non-negative")
+        ranked.append(
+            (
+                math.sqrt(squared_distance),
+                item[2],
+                item,
+                tuple(float(value) for value in candidate_descriptor),
+            )
+        )
+    ranked.sort(key=lambda item: (item[0], item[1]))
+
+    selected_records = []
+    selected_masks = []
+    within_caliper_count = sum(
+        distance <= context_distance_caliper
+        for distance, _, _, _ in ranked
+    )
+    for distance, digest, item, candidate_descriptor in ranked:
+        if distance > context_distance_caliper:
+            reject("context_distance_caliper")
+            continue
+        source_index, candidate, _, statistics = item
+        independent = True
+        for previous in selected_masks:
+            intersection = int(np.logical_and(candidate, previous).sum())
+            union = int(np.logical_or(candidate, previous).sum())
+            if intersection / union > maximum_selected_iou:
+                independent = False
+                break
+        if not independent:
+            reject("selected_control_overlap")
+            continue
+        selected_masks.append(candidate.copy())
+        selected_records.append(
+            ContextControlMatch(
+                source_index=int(source_index),
+                component_mask=candidate.copy(),
+                mask_digest=digest,
+                descriptor=candidate_descriptor,
+                mahalanobis_distance=float(distance),
+                ring_pixels=statistics.ring_pixels,
+                stencil_pixels=statistics.stencil_pixels,
+                ring_coverage=statistics.coverage,
+            )
+        )
+        if len(selected_records) == num_controls:
+            break
+    if len(selected_records) < num_controls:
+        return unavailable(
+            (
+                "target_context_out_of_candidate_support"
+                if within_caliper_count < num_controls
+                else "insufficient_independent_context_controls"
+            ),
+            target_statistics=target_statistics,
+            eligible_count=len(candidates),
+            target_descriptor=target_descriptor,
+            center=descriptor_center,
+            scale=descriptor_scale,
+            active=active_descriptors,
+            covariance=regularized,
+            condition=condition_number,
+            caliper=context_distance_caliper,
+        )
+
+    matched_control_set = TranslationControlSet(
+        component_mask=component.copy(),
+        all_target_mask=all_targets.copy(),
+        guarded_target_mask=protection.copy(),
+        translated_masks=tuple(mask.copy() for mask in selected_masks),
+        sample_key=controls.sample_key + "\0context-matched-v1",
+    )
+    return ContextMatchedControlSelection(
+        available=True,
+        reason=None,
+        control_set=matched_control_set,
+        descriptor_names=CONTEXT_DESCRIPTOR_NAMES,
+        target_descriptor=target_descriptor,
+        descriptor_center=tuple(float(value) for value in descriptor_center),
+        descriptor_scale=tuple(float(value) for value in descriptor_scale),
+        active_descriptor_mask=tuple(bool(value) for value in active_descriptors),
+        regularized_covariance=regularized.copy(),
+        covariance_condition_number=condition_number,
+        context_distance_caliper=context_distance_caliper,
+        target_ring_pixels=target_statistics.ring_pixels,
+        target_stencil_pixels=target_statistics.stencil_pixels,
+        target_ring_coverage=target_statistics.coverage,
+        eligible_candidate_count=len(candidates),
+        selected=tuple(selected_records),
+        rejected_candidate_counts=tuple(sorted(rejection_counts.items())),
     )
 
 
@@ -488,6 +1135,9 @@ def evaluate_feature_survival(
 
 
 __all__ = [
+    "CONTEXT_DESCRIPTOR_NAMES",
+    "ContextControlMatch",
+    "ContextMatchedControlSelection",
     "FeatureSurvivalResult",
     "ProjectedFootprint",
     "ProjectedGeometry",
@@ -496,4 +1146,5 @@ __all__ = [
     "evaluate_feature_survival",
     "fractional_project",
     "project_geometry_controls",
+    "select_context_matched_controls",
 ]

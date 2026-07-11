@@ -65,6 +65,16 @@ def test_stage_evidence_captures_exact_native_dag_and_prediction():
         tuple(value.shape) == (2, 1, 32, 48)
         for value in evidence["contributions"].values()
     )
+    for index in range(4):
+        head = evidence["side_heads"]["mask%d" % index]
+        module = getattr(model, "output_%d" % index)
+        assert torch.equal(head["weight"], module.weight)
+        assert torch.equal(head["bias"], module.bias)
+    assert torch.equal(evidence["final_head"]["weight"], model.final.weight)
+    assert torch.equal(evidence["final_head"]["bias"], model.final.bias)
+    assert evidence["final_head"]["stride"] == model.final.stride
+    assert evidence["final_head"]["padding"] == model.final.padding
+    assert evidence["final_head"]["dilation"] == model.final.dilation
     assert torch.allclose(
         evidence["z_reconstructed"], evidence["pred"], atol=1e-6, rtol=1e-5
     )
@@ -81,6 +91,13 @@ def test_stage_evidence_detaches_every_exposed_tensor():
     tensors = [evidence["pred"], evidence["fusion_bias"], evidence["z_reconstructed"]]
     for group in ("path", "native_sides", "full_sides", "contributions"):
         tensors.extend(evidence[group].values())
+    for head in evidence["side_heads"].values():
+        tensors.extend(value for value in head.values() if torch.is_tensor(value))
+    tensors.extend(
+        value
+        for value in evidence["final_head"].values()
+        if torch.is_tensor(value)
+    )
     assert all(not tensor.requires_grad for tensor in tensors)
 
 

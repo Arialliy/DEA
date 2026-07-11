@@ -2,10 +2,12 @@ import numpy as np
 import pytest
 
 from utils.feature_survival import (
+    TranslationControlSet,
     build_translation_control_set,
     evaluate_feature_survival,
     fractional_project,
     project_geometry_controls,
+    select_context_matched_controls,
 )
 
 
@@ -131,3 +133,275 @@ def test_nonfinite_features_fail_closed():
 
     with pytest.raises(ValueError, match="finite"):
         evaluate_feature_survival(feature, geometry)
+
+
+def _spaced_context_controls():
+    shape = (96, 96)
+    target = np.zeros(shape, dtype=bool)
+    target[40, 40] = True
+    guarded = np.zeros(shape, dtype=bool)
+    yy, xx = np.ogrid[: shape[0], : shape[1]]
+    guarded[(yy - 40) ** 2 + (xx - 40) ** 2 <= 2**2] = True
+    candidate_positions = [
+        (row, column)
+        for row in (16, 40, 64, 80)
+        for column in (16, 40, 64, 80)
+        if (row, column) != (40, 40)
+    ]
+    candidates = []
+    for row, column in candidate_positions:
+        mask = np.zeros(shape, dtype=bool)
+        mask[row, column] = True
+        candidates.append(mask)
+    controls = TranslationControlSet(
+        component_mask=target,
+        all_target_mask=target,
+        guarded_target_mask=guarded,
+        translated_masks=tuple(candidates),
+        sample_key="spaced-context-controls",
+    )
+    rows, columns = np.indices(shape)
+    image = (
+        0.012 * rows
+        + 0.007 * columns
+        + 0.3 * np.sin(rows / 7.0)
+        + 0.2 * np.cos(columns / 9.0)
+        + 0.1 * np.sin((rows + columns) / 5.0)
+    )
+    return image, controls
+
+
+def _select_spaced_context(image, controls, **kwargs):
+    return select_context_matched_controls(
+        image,
+        controls,
+        context_inner_radius=2,
+        context_ring_width=6,
+        num_controls=6,
+        minimum_ring_pixels=40,
+        minimum_stencil_pixels=24,
+        minimum_covariance_candidates=10,
+        **kwargs,
+    )
+
+
+def test_context_matching_never_uses_target_or_candidate_footprint_values():
+    image, controls = _spaced_context_controls()
+    first = _select_spaced_context(image, controls)
+    assert first.available
+
+    changed = image.copy()
+    changed[controls.component_mask] = 1e12
+    for candidate in controls.translated_masks:
+        changed[candidate] = -1e12
+    second = _select_spaced_context(changed, controls)
+
+    assert second.available
+    assert second.target_descriptor == pytest.approx(first.target_descriptor)
+    assert second.descriptor_center == pytest.approx(first.descriptor_center)
+    assert second.descriptor_scale == pytest.approx(first.descriptor_scale)
+    assert second.regularized_covariance == pytest.approx(
+        first.regularized_covariance
+    )
+    assert [item.mask_digest for item in second.selected] == [
+        item.mask_digest for item in first.selected
+    ]
+    assert [item.mahalanobis_distance for item in second.selected] == pytest.approx(
+        [item.mahalanobis_distance for item in first.selected]
+    )
+
+
+def test_context_matching_never_uses_any_protected_pixel_intensity():
+    image, controls = _spaced_context_controls()
+    protection = controls.guarded_target_mask.copy()
+    protection[8:11, 72:75] = True
+    first = _select_spaced_context(
+        image,
+        controls,
+        protection_mask=protection,
+    )
+    assert first.available
+
+    changed = image.copy()
+    changed[protection] = np.linspace(
+        -1e12,
+        1e12,
+        int(protection.sum()),
+    )
+    second = _select_spaced_context(
+        changed,
+        controls,
+        protection_mask=protection,
+    )
+
+    assert second.available
+    assert second.target_descriptor == pytest.approx(first.target_descriptor)
+    assert second.descriptor_center == pytest.approx(first.descriptor_center)
+    assert second.descriptor_scale == pytest.approx(first.descriptor_scale)
+    assert second.regularized_covariance == pytest.approx(
+        first.regularized_covariance
+    )
+    assert [item.mask_digest for item in second.selected] == [
+        item.mask_digest for item in first.selected
+    ]
+    assert [item.mahalanobis_distance for item in second.selected] == pytest.approx(
+        [item.mahalanobis_distance for item in first.selected]
+    )
+
+
+def test_context_matching_is_order_invariant_and_exposes_deterministic_ties():
+    image, controls = _spaced_context_controls()
+    constant = np.zeros_like(image)
+    first = _select_spaced_context(constant, controls)
+    reversed_controls = TranslationControlSet(
+        component_mask=controls.component_mask,
+        all_target_mask=controls.all_target_mask,
+        guarded_target_mask=controls.guarded_target_mask,
+        translated_masks=tuple(reversed(controls.translated_masks)),
+        sample_key=controls.sample_key,
+    )
+    second = _select_spaced_context(constant, reversed_controls)
+
+    assert first.available and second.available
+    assert first.covariance_condition_number == pytest.approx(1.0)
+    assert all(item.mahalanobis_distance == 0 for item in first.selected)
+    first_digests = [item.mask_digest for item in first.selected]
+    second_digests = [item.mask_digest for item in second.selected]
+    assert first_digests == sorted(first_digests)
+    assert second_digests == first_digests
+
+
+def test_context_matching_is_invariant_to_positive_affine_image_scaling():
+    image, controls = _spaced_context_controls()
+    first = _select_spaced_context(image, controls)
+    transformed = _select_spaced_context(3.5 * image + 17.0, controls)
+
+    assert first.available and transformed.available
+    assert [item.mask_digest for item in transformed.selected] == [
+        item.mask_digest for item in first.selected
+    ]
+    assert [
+        item.mahalanobis_distance for item in transformed.selected
+    ] == pytest.approx(
+        [item.mahalanobis_distance for item in first.selected],
+        rel=1e-9,
+        abs=1e-10,
+    )
+
+
+def test_context_matching_enforces_protection_and_control_independence():
+    image, controls = _spaced_context_controls()
+    protection = controls.guarded_target_mask.copy()
+    protection |= controls.translated_masks[0]
+    result = _select_spaced_context(
+        image,
+        controls,
+        protection_mask=protection,
+    )
+
+    assert result.available
+    assert dict(result.rejected_candidate_counts)["protection_overlap"] == 1
+    selected_masks = [item.component_mask for item in result.selected]
+    assert all(not np.any(mask & protection) for mask in selected_masks)
+    for index, mask in enumerate(selected_masks):
+        for previous in selected_masks[:index]:
+            assert not np.any(mask & previous)
+
+
+def test_context_matching_rejects_same_area_nontranslation_controls():
+    image, singleton_controls = _spaced_context_controls()
+    component = np.zeros_like(singleton_controls.component_mask)
+    component[40, 40:42] = True
+    guarded = np.zeros_like(component)
+    rows, columns = np.indices(component.shape)
+    guarded[
+        np.minimum(
+            (rows - 40) ** 2 + (columns - 40) ** 2,
+            (rows - 40) ** 2 + (columns - 41) ** 2,
+        )
+        <= 2**2
+    ] = True
+
+    translated = []
+    for singleton in singleton_controls.translated_masks:
+        row, column = np.argwhere(singleton)[0]
+        candidate = np.zeros_like(component)
+        candidate[row, column : column + 2] = True
+        translated.append(candidate)
+    deformation = np.zeros_like(component)
+    deformation[8:10, 8] = True
+    controls = TranslationControlSet(
+        component_mask=component,
+        all_target_mask=component,
+        guarded_target_mask=guarded,
+        translated_masks=(deformation, *translated),
+        sample_key="same-area-deformation",
+    )
+
+    result = select_context_matched_controls(
+        image,
+        controls,
+        context_inner_radius=2,
+        context_ring_width=6,
+        num_controls=6,
+        minimum_ring_pixels=40,
+        minimum_stencil_pixels=24,
+        minimum_covariance_candidates=10,
+        maximum_selected_iou=0.99,
+    )
+
+    assert result.available
+    assert dict(result.rejected_candidate_counts)["geometry_mismatch"] == 1
+    assert all(
+        np.array_equal(
+            np.argwhere(item.component_mask) - np.argwhere(component),
+            np.repeat(
+                (np.argwhere(item.component_mask)[0] - np.argwhere(component)[0])[
+                    None, :
+                ],
+                int(component.sum()),
+                axis=0,
+            ),
+        )
+        for item in result.selected
+    )
+
+
+def test_context_matching_fails_closed_without_an_exterior_ring():
+    image, controls = _spaced_context_controls()
+    result = _select_spaced_context(
+        image,
+        controls,
+        protection_mask=np.ones_like(controls.component_mask),
+    )
+
+    assert not result.available
+    assert result.reason == "insufficient_target_exterior_context"
+    assert result.control_set is None
+
+
+def test_context_matching_fails_closed_when_target_context_has_no_support():
+    image, controls = _spaced_context_controls()
+    rows, columns = np.indices(image.shape)
+    distance = np.sqrt((rows - 40) ** 2 + (columns - 40) ** 2)
+    unmatched = image.copy()
+    ring = (distance > 2) & (distance <= 8)
+    unmatched[ring] += 100.0 * ((rows[ring] + columns[ring]) % 2)
+
+    result = _select_spaced_context(unmatched, controls)
+
+    assert not result.available
+    assert result.reason == "target_context_out_of_candidate_support"
+    assert result.context_distance_caliper is not None
+    assert dict(result.rejected_candidate_counts)["context_distance_caliper"] > 0
+
+
+def test_context_matching_rejects_a_protection_mask_that_omits_targets():
+    image, controls = _spaced_context_controls()
+
+    with pytest.raises(ValueError, match="include every target"):
+        _select_spaced_context(
+            image,
+            controls,
+            protection_mask=np.zeros_like(controls.component_mask),
+        )
