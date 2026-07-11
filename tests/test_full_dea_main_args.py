@@ -112,6 +112,11 @@ def test_run_folder_name_uses_method_name() -> None:
     )
 
 
+def test_method_metadata_persists_run_label() -> None:
+    args = validate_args(make_args(run_label="nuaa_seed_11"))
+    assert get_method_metadata(args)["run_label"] == "nuaa_seed_11"
+
+
 def test_integrated_method_name_exposes_residual_alignment() -> None:
     args = validate_args(make_args(model_type="dea_integrated"))
     assert get_method_name(args) == "DEAIntegrated-ResidualAligned"

@@ -392,6 +392,7 @@ def get_method_metadata(args):
         "test_split_sha256": getattr(args, "test_split_sha256", ""),
         "seed": int(args.seed),
         "deterministic": bool(args.deterministic),
+        "run_label": getattr(args, "run_label", ""),
     }
 
 def parse_args():
@@ -424,6 +425,22 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--weight-path', type=str, default=osp.join(DEFAULT_WEIGHT_DIR, 'IRSTD-1k_weight.tar'))
     parser.add_argument('--checkpoint-dir', type=str, default='')
+    parser.add_argument(
+        '--run-dir',
+        type=str,
+        default='',
+        help=(
+            'Exact output directory for a new training run. Relative paths '
+            'are resolved from the project root. The directory must be empty; '
+            'use --if-checkpoint with --checkpoint-dir to resume.'
+        ),
+    )
+    parser.add_argument(
+        '--run-label',
+        type=str,
+        default='',
+        help='Stable experiment label persisted in checkpoint metadata.',
+    )
     parser.add_argument(
         '--model-type',
         type=str,
@@ -735,10 +752,24 @@ class Trainer(object):
                 self.best_pd_fa_epoch = int(checkpoint.get('best_pd_fa_epoch', -1))
                 self.save_folder = check_folder
             else:
-                self.save_folder = osp.join(
-                    DEFAULT_WEIGHT_DIR,
-                    get_run_folder_name(args),
-                )
+                requested_run_dir = getattr(args, 'run_dir', '')
+                if requested_run_dir:
+                    self.save_folder = requested_run_dir
+                    if not osp.isabs(self.save_folder):
+                        self.save_folder = osp.join(PROJECT_DIR, self.save_folder)
+                    self.save_folder = osp.normpath(self.save_folder)
+                    if osp.isdir(self.save_folder) and os.listdir(self.save_folder):
+                        raise FileExistsError(
+                            'Refusing to overwrite non-empty --run-dir %s; '
+                            'resume with --if-checkpoint true '
+                            '--checkpoint-dir %s.'
+                            % (self.save_folder, self.save_folder)
+                        )
+                else:
+                    self.save_folder = osp.join(
+                        DEFAULT_WEIGHT_DIR,
+                        get_run_folder_name(args),
+                    )
                 os.makedirs(self.save_folder, exist_ok=True)
             self.persist_split_manifests()
         if args.mode=='test':
@@ -811,6 +842,25 @@ class Trainer(object):
             with open(manifest_path, 'w') as f:
                 for name in dataset.names:
                     f.write(name + '\n')
+
+        config_path = osp.join(self.save_folder, 'run_config.json')
+        serializable_args = {}
+        for key, value in sorted(vars(self.args).items()):
+            if value is None or isinstance(value, (bool, int, float, str)):
+                serializable_args[key] = value
+            else:
+                serializable_args[key] = repr(value)
+        with open(config_path, 'w') as f:
+            json.dump(
+                {
+                    'args': serializable_args,
+                    'method_meta': get_method_metadata(self.args),
+                },
+                f,
+                indent=2,
+                sort_keys=True,
+            )
+            f.write('\n')
 
     def validate_integrated_checkpoint_metadata(
         self,
