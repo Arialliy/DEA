@@ -3,7 +3,10 @@ from __future__ import annotations
 from argparse import Namespace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
+from PIL import Image
 
 from main import Trainer
 from utils.data import IRSTD_Dataset
@@ -94,3 +97,39 @@ def test_duplicate_manifest_names_are_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match='Duplicate sample names'):
         IRSTD_Dataset(args, mode='train')
+
+
+def test_training_worker_can_return_eight_connected_instance_labels(tmp_path):
+    names = ['sample_%02d' % index for index in range(4)]
+    write_split(
+        tmp_path / 'img_idx' / ('train_%s.txt' % tmp_path.name),
+        names,
+    )
+    write_split(
+        tmp_path / 'img_idx' / ('test_%s.txt' % tmp_path.name),
+        ['test_sample'],
+    )
+    (tmp_path / 'images').mkdir()
+    (tmp_path / 'masks').mkdir()
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    mask = np.zeros((16, 16), dtype=np.uint8)
+    mask[1, 1] = 255
+    mask[2, 2] = 255
+    mask[12, 12] = 255
+    for name in names:
+        Image.fromarray(image).save(tmp_path / 'images' / (name + '.png'))
+        Image.fromarray(mask).save(tmp_path / 'masks' / (name + '.png'))
+
+    args = make_args(tmp_path, return_instance_labels=True)
+    dataset = IRSTD_Dataset(args, mode='train')
+    dataset._sync_transform = lambda image_value, mask_value: (
+        image_value,
+        mask_value,
+    )
+    image_tensor, mask_tensor, instance_labels = dataset[0]
+
+    assert image_tensor.shape == (3, 16, 16)
+    assert mask_tensor.shape == instance_labels.shape == (1, 16, 16)
+    assert instance_labels.dtype == torch.long
+    assert torch.equal(instance_labels > 0, mask_tensor > 0.5)
+    assert int(instance_labels.max()) == 2

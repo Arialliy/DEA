@@ -21,6 +21,9 @@ from model.full_dea_mshnet import FullDEAMSHNet
 def make_args(**kwargs):
     args = Namespace(
         model_type="mshnet",
+        mshnet_objective="sls",
+        mshnet_side_supervision="canonical",
+        mshnet_train_graph="canonical_warm",
         init_from_baseline="",
         if_checkpoint=False,
         dea_lambda_single=0.0,
@@ -246,3 +249,131 @@ def test_frozen_backbone_keeps_batchnorm_statistics_fixed() -> None:
         if isinstance(module, nn.modules.batchnorm._BatchNorm):
             assert not module.training, name
     assert trainer.model.full_dea_head.training
+
+
+def test_default_mshnet_training_semantics_remain_canonical() -> None:
+    args = validate_args(make_args())
+    assert get_method_name(args) == "MSHNet"
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    trainer.warm_epoch = 5
+    assert Trainer.get_forward_tag(trainer, epoch=0) is False
+    assert Trainer.get_forward_tag(trainer, epoch=6) is True
+
+
+def test_omm2d_training_semantics_are_fail_closed_and_named() -> None:
+    args = validate_args(make_args(
+        mshnet_objective="omm2d_identity",
+        mshnet_side_supervision="none",
+        mshnet_train_graph="full",
+    ))
+    assert get_method_name(args) == "MSHNet-OMM2D-Identity-FullGraph"
+    metadata = get_method_metadata(args)
+    assert metadata["mshnet_objective"] == "omm2d_identity"
+    assert metadata["mshnet_side_supervision"] == "none"
+    assert metadata["mshnet_train_graph"] == "full"
+    assert metadata["omm2d_connectivity"] == 2
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    trainer.warm_epoch = 5
+    assert Trainer.get_forward_tag(trainer, epoch=0) is True
+
+    with pytest.raises(ValueError, match="side-supervision none"):
+        validate_args(make_args(
+            mshnet_objective="omm2d_identity",
+            mshnet_train_graph="full",
+        ))
+    with pytest.raises(ValueError, match="train-graph full"):
+        validate_args(make_args(
+            mshnet_objective="omm2d_identity",
+            mshnet_side_supervision="none",
+        ))
+    with pytest.raises(ValueError, match="require --model-type mshnet"):
+        validate_args(make_args(
+            model_type="full_dea",
+            mshnet_objective="omm2d_identity",
+            mshnet_side_supervision="none",
+            mshnet_train_graph="full",
+        ))
+
+
+def test_instance_logistic_is_named_as_a_separate_control() -> None:
+    args = validate_args(make_args(
+        mshnet_objective="instance_balanced_logistic",
+        mshnet_side_supervision="none",
+        mshnet_train_graph="full",
+    ))
+    assert get_method_name(args) == (
+        "MSHNet-InstanceBalancedLogistic-FullGraph"
+    )
+
+
+def test_instance_objective_uses_final_prediction_not_side_losses() -> None:
+    args = validate_args(make_args(
+        mshnet_objective="omm2d_identity",
+        mshnet_side_supervision="none",
+        mshnet_train_graph="full",
+    ))
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    pred = torch.zeros(1, 1, 4, 4, requires_grad=True)
+    side = torch.randn(1, 1, 4, 4, requires_grad=True)
+    target = torch.zeros_like(pred)
+    target[0, 0, 1, 1] = 1
+    instances = target.long()
+
+    loss, result = Trainer.compute_plain_mshnet_objective(
+        trainer,
+        pred,
+        [side],
+        target,
+        instances,
+        epoch=0,
+    )
+    loss.backward()
+
+    assert result is not None
+    assert pred.grad is not None and float(pred.grad.abs().sum()) > 0
+    assert side.grad is None
+
+
+def test_noncanonical_mshnet_checkpoint_metadata_fails_closed() -> None:
+    args = validate_args(make_args(
+        mshnet_objective="omm2d_identity",
+        mshnet_side_supervision="none",
+        mshnet_train_graph="full",
+    ))
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+
+    with pytest.raises(RuntimeError, match="requires a checkpoint"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer,
+            {"weight": torch.ones(1)},
+            check_split_hashes=False,
+        )
+
+    metadata = get_method_metadata(args)
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer,
+        {"method_meta": metadata},
+        check_split_hashes=False,
+    )
+    mismatched = dict(metadata)
+    mismatched["mshnet_objective"] = "instance_balanced_logistic"
+    with pytest.raises(RuntimeError, match="mshnet_objective"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer,
+            {"method_meta": mismatched},
+            check_split_hashes=False,
+        )
+
+    canonical_trainer = Trainer.__new__(Trainer)
+    canonical_trainer.args = validate_args(make_args())
+    with pytest.raises(RuntimeError, match="mshnet_objective"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            canonical_trainer,
+            {"method_meta": metadata},
+            check_split_hashes=False,
+        )

@@ -11,6 +11,7 @@ import random
 import shutil
 import glob
 import hashlib
+from skimage import measure
 
 
 class IRSTD_Dataset(Data.Dataset):
@@ -54,6 +55,10 @@ class IRSTD_Dataset(Data.Dataset):
             self.names = source_names
 
         self.mode = mode
+        self.return_instance_labels = bool(
+            mode == 'train'
+            and getattr(args, 'return_instance_labels', False)
+        )
         self.crop_size = args.crop_size
         self.base_size = args.base_size
         self.transform = transforms.Compose([
@@ -154,6 +159,13 @@ class IRSTD_Dataset(Data.Dataset):
 
         
         img, mask = self.transform(img), transforms.ToTensor()(mask)
+        if self.return_instance_labels:
+            instance_labels = measure.label(
+                mask[0].numpy() > 0.5,
+                connectivity=2,
+            )
+            instance_labels = torch.from_numpy(instance_labels).long().unsqueeze(0)
+            return img, mask, instance_labels
         return img, mask
 
     def __len__(self):

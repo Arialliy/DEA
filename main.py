@@ -21,6 +21,10 @@ from model.full_dea_loss import (
     full_dea_aux_loss_v3,
     full_dea_aux_loss_v4,
 )
+from model.omm_flow import (
+    instance_balanced_logistic_risk,
+    omm2d_identity_risk,
+)
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -30,12 +34,20 @@ import glob
 import random
 import numpy as np
 import json
+import hashlib
 
 PROJECT_DIR = osp.dirname(osp.abspath(__file__))
 DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
 DEFAULT_WEIGHT_DIR = osp.join(PROJECT_DIR, 'weight')
 DEA_MODEL_TYPES = ('dea', 'predictive_correction')
 CEV_CONTROL_TYPES = ('dea_fine_veto_control', 'dea_cev_control')
+MSHNET_OBJECTIVES = (
+    'sls',
+    'omm2d_identity',
+    'instance_balanced_logistic',
+)
+MSHNET_SIDE_SUPERVISION = ('canonical', 'none')
+MSHNET_TRAIN_GRAPHS = ('canonical_warm', 'full')
 
 
 def is_dea_main_model(model_type):
@@ -43,6 +55,21 @@ def is_dea_main_model(model_type):
 
 def is_cev_control(model_type):
     return model_type in CEV_CONTROL_TYPES
+
+def get_mshnet_training_semantics(args):
+    return (
+        getattr(args, 'mshnet_objective', 'sls'),
+        getattr(args, 'mshnet_side_supervision', 'canonical'),
+        getattr(args, 'mshnet_train_graph', 'canonical_warm'),
+    )
+
+def is_noncanonical_mshnet_training(args):
+    objective, side_supervision, train_graph = get_mshnet_training_semantics(args)
+    return (
+        objective != 'sls'
+        or side_supervision != 'canonical'
+        or train_graph != 'canonical_warm'
+    )
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -59,6 +86,13 @@ def load_torch_file(path):
         return torch.load(path, weights_only=False)
     except TypeError:
         return torch.load(path)
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 def get_dea_ramp(epoch, warm_epoch, ramp_epochs):
     if ramp_epochs <= 0:
@@ -243,6 +277,42 @@ def validate_args(args):
         val_fraction = float(getattr(args, "val_fraction", 0.2))
         if not 0.0 < val_fraction < 1.0:
             raise ValueError("--val-fraction must be strictly between 0 and 1.")
+
+    objective, side_supervision, train_graph = get_mshnet_training_semantics(args)
+    if objective not in MSHNET_OBJECTIVES:
+        raise ValueError("unknown --mshnet-objective: %s" % objective)
+    if side_supervision not in MSHNET_SIDE_SUPERVISION:
+        raise ValueError(
+            "unknown --mshnet-side-supervision: %s" % side_supervision
+        )
+    if train_graph not in MSHNET_TRAIN_GRAPHS:
+        raise ValueError("unknown --mshnet-train-graph: %s" % train_graph)
+
+    if is_noncanonical_mshnet_training(args) and args.model_type != 'mshnet':
+        raise ValueError(
+            "non-canonical MSHNet objective/side/graph controls require "
+            "--model-type mshnet"
+        )
+    if objective != 'sls':
+        if side_supervision != 'none':
+            raise ValueError(
+                "instance-risk objectives replace deep supervision; set "
+                "--mshnet-side-supervision none"
+            )
+        if train_graph != 'full':
+            raise ValueError(
+                "instance-risk objectives require the canonical final fusion "
+                "from epoch zero; set --mshnet-train-graph full"
+            )
+        lite_lambdas = (
+            args.dea_lambda_single,
+            args.dea_lambda_dec,
+            args.dea_lambda_empty,
+        )
+        if any(float(value) != 0.0 for value in lite_lambdas):
+            raise ValueError(
+                "instance-risk objectives and DEA-lite losses must not be mixed"
+            )
     return args
 
 def get_method_name(args):
@@ -292,6 +362,15 @@ def get_method_name(args):
         if version == "v5":
             return "FullDEA-v5-CRR-HT"
         return "FullDEA-v3-TPS"
+    if args.model_type == "mshnet" and is_noncanonical_mshnet_training(args):
+        objective, side_supervision, train_graph = get_mshnet_training_semantics(args)
+        if objective == 'omm2d_identity':
+            return "MSHNet-OMM2D-Identity-FullGraph"
+        if objective == 'instance_balanced_logistic':
+            return "MSHNet-InstanceBalancedLogistic-FullGraph"
+        side_name = 'DeepSupervision' if side_supervision == 'canonical' else 'FinalOnly'
+        graph_name = 'CanonicalWarm' if train_graph == 'canonical_warm' else 'FullGraph'
+        return "MSHNet-SLS-%s-%s" % (side_name, graph_name)
     if (
         args.dea_lambda_single > 0
         or args.dea_lambda_dec > 0
@@ -309,6 +388,9 @@ def get_run_folder_name(args, timestamp=None):
     return '%s-%s' % (safe_method, timestamp)
 
 def get_method_metadata(args):
+    mshnet_objective, mshnet_side_supervision, mshnet_train_graph = (
+        get_mshnet_training_semantics(args)
+    )
     return {
         "method": get_method_name(args),
         "model_type": args.model_type,
@@ -320,6 +402,18 @@ def get_method_metadata(args):
         "init_from_baseline": getattr(
             args, "origin_baseline_checkpoint", args.init_from_baseline
         ),
+        "init_checkpoint_sha256": getattr(args, "init_checkpoint_sha256", ""),
+        "mshnet_objective": mshnet_objective,
+        "mshnet_side_supervision": mshnet_side_supervision,
+        "mshnet_train_graph": mshnet_train_graph,
+        "instance_objective_version": "v1",
+        "omm2d_version": (
+            "identity_v1" if mshnet_objective == "omm2d_identity" else ""
+        ),
+        "omm2d_target_threshold": 0.5,
+        "omm2d_connectivity": 2,
+        "instance_fa_reduction": "batch_pixel_mean",
+        "instance_miss_reduction": "batch_global_instance_mean",
         "full_dea_lambda": float(args.full_dea_lambda),
         "full_dea_ramp_epochs": int(args.full_dea_ramp_epochs),
         "full_dea_start_epoch": int(args.full_dea_start_epoch),
@@ -413,6 +507,28 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=400)
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--warm-epoch', type=int, default=5)
+    parser.add_argument(
+        '--mshnet-objective',
+        type=str,
+        default='sls',
+        choices=MSHNET_OBJECTIVES,
+        help=(
+            'Training objective for plain MSHNet. Non-SLS objectives are '
+            'fail-closed research controls and require final-only/full-graph.'
+        ),
+    )
+    parser.add_argument(
+        '--mshnet-side-supervision',
+        type=str,
+        default='canonical',
+        choices=MSHNET_SIDE_SUPERVISION,
+    )
+    parser.add_argument(
+        '--mshnet-train-graph',
+        type=str,
+        default='canonical_warm',
+        choices=MSHNET_TRAIN_GRAPHS,
+    )
 
     parser.add_argument('--base-size', type=int, default=256)
     parser.add_argument('--crop-size', type=int, default=256)
@@ -574,6 +690,19 @@ class Trainer(object):
 
         self.args = args
         setattr(args, 'origin_baseline_checkpoint', args.init_from_baseline)
+        if args.init_from_baseline:
+            setattr(
+                args,
+                'init_checkpoint_sha256',
+                sha256_file(args.init_from_baseline),
+            )
+        else:
+            setattr(args, 'init_checkpoint_sha256', '')
+        setattr(
+            args,
+            'return_instance_labels',
+            getattr(args, 'mshnet_objective', 'sls') != 'sls',
+        )
         self.start_epoch = 0   
         self.mode = args.mode
 
@@ -727,13 +856,19 @@ class Trainer(object):
                     checkpoint,
                     check_split_hashes=True,
                 )
-                if args.model_type == 'dea_integrated':
+                if isinstance(checkpoint, dict):
+                    checkpoint_meta = checkpoint.get('method_meta', {})
                     setattr(
                         args,
                         'origin_baseline_checkpoint',
-                        checkpoint.get('method_meta', {}).get(
+                        checkpoint_meta.get(
                             'init_from_baseline', ''
                         ),
+                    )
+                    setattr(
+                        args,
+                        'init_checkpoint_sha256',
+                        checkpoint_meta.get('init_checkpoint_sha256', ''),
                     )
                 self.load_model_state(checkpoint['net'])
                 if args.reset_optimizer:
@@ -867,11 +1002,34 @@ class Trainer(object):
         checkpoint,
         check_split_hashes,
     ):
-        if (
-            self.args.model_type != 'dea_integrated'
-            and not is_dea_main_model(self.args.model_type)
-            and not is_cev_control(self.args.model_type)
-        ):
+        checkpoint_metadata = (
+            checkpoint.get('method_meta', {})
+            if isinstance(checkpoint, dict)
+            else {}
+        )
+        checkpoint_noncanonical_mshnet = (
+            checkpoint_metadata.get('model_type') == 'mshnet'
+            and (
+                checkpoint_metadata.get('mshnet_objective', 'sls') != 'sls'
+                or checkpoint_metadata.get(
+                    'mshnet_side_supervision', 'canonical'
+                ) != 'canonical'
+                or checkpoint_metadata.get(
+                    'mshnet_train_graph', 'canonical_warm'
+                ) != 'canonical_warm'
+            )
+        )
+        requires_metadata = (
+            self.args.model_type == 'dea_integrated'
+            or is_dea_main_model(self.args.model_type)
+            or is_cev_control(self.args.model_type)
+            or (
+                self.args.model_type == 'mshnet'
+                and is_noncanonical_mshnet_training(self.args)
+            )
+            or checkpoint_noncanonical_mshnet
+        )
+        if not requires_metadata:
             return
         if not isinstance(checkpoint, dict) or 'method_meta' not in checkpoint:
             raise RuntimeError(
@@ -883,7 +1041,21 @@ class Trainer(object):
 
         metadata = checkpoint['method_meta']
         expected = get_method_metadata(self.args)
-        if is_cev_control(self.args.model_type):
+        if self.args.model_type == 'mshnet':
+            semantic_keys = (
+                'model_type',
+                'mshnet_objective',
+                'mshnet_side_supervision',
+                'mshnet_train_graph',
+                'instance_objective_version',
+                'omm2d_version',
+                'omm2d_target_threshold',
+                'omm2d_connectivity',
+                'instance_fa_reduction',
+                'instance_miss_reduction',
+                'test_split_sha256',
+            )
+        elif is_cev_control(self.args.model_type):
             semantic_keys = (
                 'model_type',
                 'cev_kernel_size',
@@ -1062,6 +1234,13 @@ class Trainer(object):
         )
 
     def get_forward_tag(self, epoch):
+        if (
+            self.args.model_type == 'mshnet'
+            and getattr(
+                self.args, 'mshnet_train_graph', 'canonical_warm'
+            ) == 'full'
+        ):
+            return True
         if is_cev_control(self.args.model_type):
             # CEV is a frozen-checkpoint control over the complete four-scale
             # MSHNet graph; there is no cold single-head training phase.
@@ -1374,15 +1553,131 @@ class Trainer(object):
             + 0.2 * loss_eighth
         )
 
+    def compute_plain_mshnet_objective(
+        self,
+        pred,
+        masks,
+        labels,
+        instance_labels,
+        epoch,
+    ):
+        objective = getattr(self.args, 'mshnet_objective', 'sls')
+        if objective == 'omm2d_identity':
+            if instance_labels is None:
+                raise RuntimeError(
+                    'OMM2D training requires instance labels from the DataLoader'
+                )
+            result = omm2d_identity_risk(
+                pred,
+                labels,
+                instance_labels=instance_labels,
+                validate_instance_labels=False,
+            )
+            return result['loss'], result
+        if objective == 'instance_balanced_logistic':
+            if instance_labels is None:
+                raise RuntimeError(
+                    'instance-balanced logistic training requires instance labels'
+                )
+            result = instance_balanced_logistic_risk(
+                pred,
+                labels,
+                instance_labels=instance_labels,
+                validate_instance_labels=False,
+            )
+            return result['loss'], result
+
+        loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
+        side_supervision = getattr(
+            self.args, 'mshnet_side_supervision', 'canonical'
+        )
+        if side_supervision == 'canonical':
+            labels_for_scale = labels
+            for j in range(len(masks)):
+                if j > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                loss = loss + self.loss_fun(
+                    masks[j], labels_for_scale, self.warm_epoch, epoch
+                )
+            loss = loss / (len(masks) + 1)
+        return loss, None
+
+    @staticmethod
+    def new_instance_objective_audit():
+        return {
+            'optimization_loss_times_images': 0.0,
+            'false_alarm_numerator': 0.0,
+            'miss_numerator': 0.0,
+            'pixels': 0,
+            'instances': 0,
+            'empty_images': 0,
+            'images': 0,
+        }
+
+    @staticmethod
+    def update_instance_objective_audit(audit, result, batch_size):
+        audit['optimization_loss_times_images'] += float(
+            result['loss'].detach()
+        ) * int(batch_size)
+        audit['false_alarm_numerator'] += float(
+            result['false_alarm_numerator'].detach()
+        )
+        audit['miss_numerator'] += float(result['miss_numerator'].detach())
+        audit['pixels'] += int(result['num_pixels'])
+        audit['instances'] += int(result['num_instances'])
+        audit['empty_images'] += int(result['num_empty_images'])
+        audit['images'] += int(batch_size)
+
+    def finalize_instance_objective_audit(self, audit, epoch):
+        report = {
+            'epoch': int(epoch),
+            'objective': getattr(self.args, 'mshnet_objective', 'sls'),
+            'optimization_loss_image_mean': (
+                audit['optimization_loss_times_images']
+                / max(1, audit['images'])
+            ),
+            'false_alarm_global': (
+                audit['false_alarm_numerator'] / max(1, audit['pixels'])
+            ),
+            'miss_global': (
+                audit['miss_numerator'] / max(1, audit['instances'])
+            ),
+            **audit,
+        }
+        with open(
+            osp.join(self.save_folder, 'instance_objective_train.jsonl'),
+            'a',
+        ) as handle:
+            handle.write(json.dumps(report, sort_keys=True) + '\n')
+        print('[INSTANCE OBJECTIVE] ' + json.dumps(report, sort_keys=True))
+
     def train(self, epoch):
         self.model.train()
         self.configure_full_dea_trainable(epoch)
         tbar = tqdm(self.train_loader)
         losses = AverageMeter()
-        for i, (data, mask) in enumerate(tbar):
+        instance_audit = (
+            self.new_instance_objective_audit()
+            if (
+                self.args.model_type == 'mshnet'
+                and getattr(self.args, 'mshnet_objective', 'sls') != 'sls'
+            )
+            else None
+        )
+        for i, batch in enumerate(tbar):
+            if len(batch) == 3:
+                data, mask, instance_labels = batch
+            else:
+                data, mask = batch
+                instance_labels = None
   
             data = data.to(self.device, non_blocking=True)
             labels = mask.to(self.device, non_blocking=True)
+            if instance_labels is not None:
+                instance_labels = instance_labels.to(
+                    self.device,
+                    non_blocking=True,
+                )
 
             tag = self.get_forward_tag(epoch)
             use_dea = self.use_dea(epoch)
@@ -1390,6 +1685,7 @@ class Trainer(object):
             full_dea_out = None
             dea_main_out = None
             cev_out = None
+            instance_result = None
             if is_cev_control(self.args.model_type):
                 out = self.model(data, True, return_dict=True)
                 masks = out["masks"]
@@ -1441,6 +1737,20 @@ class Trainer(object):
                 loss = self.dea_main_loss(
                     dea_main_out["state_logits"], labels, epoch
                 )
+            elif self.args.model_type == 'mshnet':
+                loss, instance_result = self.compute_plain_mshnet_objective(
+                    pred,
+                    masks,
+                    labels,
+                    instance_labels,
+                    epoch,
+                )
+                if instance_audit is not None:
+                    self.update_instance_objective_audit(
+                        instance_audit,
+                        instance_result,
+                        pred.shape[0],
+                    )
             else:
                 loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
                 labels_for_scale = labels
@@ -1615,7 +1925,21 @@ class Trainer(object):
             self.optimizer.step()
        
             losses.update(loss.item(), pred.size(0))
-            tbar.set_description('Epoch %d, loss %.4f' % (epoch, losses.avg))
+            if instance_result is None:
+                tbar.set_description('Epoch %d, loss %.4f' % (epoch, losses.avg))
+            else:
+                tbar.set_description(
+                    'Epoch %d, loss %.4f, fa %.4f, miss %.4f, K %d'
+                    % (
+                        epoch,
+                        losses.avg,
+                        float(instance_result['false_alarm_risk'].detach()),
+                        float(instance_result['miss_risk'].detach()),
+                        int(instance_result['num_instances']),
+                    )
+                )
+        if instance_audit is not None:
+            self.finalize_instance_objective_audit(instance_audit, epoch)
     
     def test(self, epoch):
         self.model.eval()
@@ -1695,11 +2019,14 @@ class Trainer(object):
 
                 if mean_IoU > self.best_iou:
                     self.best_iou = mean_IoU
-                
-                    torch.save(
-                        self.model.state_dict(),
-                        osp.join(self.save_folder, 'weight.pkl'),
-                    )
+                    if not (
+                        self.args.model_type == 'mshnet'
+                        and is_noncanonical_mshnet_training(self.args)
+                    ):
+                        torch.save(
+                            self.model.state_dict(),
+                            osp.join(self.save_folder, 'weight.pkl'),
+                        )
 
                     best_iou_states = {
                         "net": self.model.state_dict(),
@@ -1731,10 +2058,14 @@ class Trainer(object):
                     self.best_pd_fa_pd = current_pd
                     self.best_pd_fa_epoch = epoch
 
-                    torch.save(
-                        self.model.state_dict(),
-                        osp.join(self.save_folder, 'weight_pd_fa_best.pkl'),
-                    )
+                    if not (
+                        self.args.model_type == 'mshnet'
+                        and is_noncanonical_mshnet_training(self.args)
+                    ):
+                        torch.save(
+                            self.model.state_dict(),
+                            osp.join(self.save_folder, 'weight_pd_fa_best.pkl'),
+                        )
 
                     pd_fa_states = {
                         "net": self.model.state_dict(),
