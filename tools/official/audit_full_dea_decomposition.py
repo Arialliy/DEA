@@ -16,6 +16,7 @@ from model.full_dea_loss import (
     build_hard_clutter_label,
 )
 from model.full_dea_mshnet import FullDEAMSHNet
+from model.mshnet_checkpoint import strip_legacy_dea_lite_head
 from utils.data import IRSTD_Dataset
 from utils.metric import PD_FA, mIoU
 
@@ -158,7 +159,7 @@ def main() -> None:
 
     model = FullDEAMSHNet(3, full_dea_version=args.full_dea_version)
     state = strip_module_prefix(extract_state_dict(load_torch_file(args.weight)))
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(strip_legacy_dea_lite_head(state), strict=True)
     model.to(device)
     model.eval()
 

@@ -5,6 +5,7 @@ import  numpy as np
 import torch.nn as nn
 import torch
 from skimage import measure
+from scipy.optimize import linear_sum_assignment
 import  numpy
 
 
@@ -85,6 +86,285 @@ def match_connected_components(
         unmatched_prediction_indices=tuple(unmatched_predictions),
         unmatched_target_indices=tuple(unmatched_targets),
     )
+
+
+def _finite_2d_array(value, *, name):
+    """Return a finite, non-empty 2-D NumPy array for new metric APIs."""
+
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    array = np.asarray(value)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be a 2-D array")
+    if array.shape[0] == 0 or array.shape[1] == 0:
+        raise ValueError(f"{name} must have non-zero height and width")
+    try:
+        finite = np.isfinite(array)
+    except TypeError as exc:
+        raise ValueError(f"{name} must contain numeric or boolean values") from exc
+    if not bool(np.all(finite)):
+        raise ValueError(f"{name} must contain only finite values")
+    return array
+
+
+def _binary_2d_array(value, *, name):
+    array = _finite_2d_array(value, name=name)
+    if not bool(np.all((array == 0) | (array == 1))):
+        raise ValueError(f"{name} must be binary (0/1 or boolean)")
+    return array.astype(bool, copy=False)
+
+
+def _validate_new_component_arguments(
+    prediction,
+    target,
+    *,
+    centroid_radius,
+    connectivity,
+):
+    prediction_array = _binary_2d_array(prediction, name="prediction")
+    target_array = _binary_2d_array(target, name="target")
+    if prediction_array.shape != target_array.shape:
+        raise ValueError("prediction and target shapes must match")
+    try:
+        radius = float(centroid_radius)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("centroid_radius must be a finite positive number") from exc
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("centroid_radius must be a finite positive number")
+    # CCSR is defined on the repository's 8-connected component convention.
+    # Failing closed here prevents silently changing the prediction unit.
+    if connectivity != 2:
+        raise ValueError("connectivity must be 2 (8-connectivity for a 2-D image)")
+    return prediction_array, target_array, radius
+
+
+def match_components_hungarian(
+    pred_mask,
+    target_mask,
+    *,
+    centroid_radius=3.0,
+    connectivity=2,
+):
+    """Order-invariant one-to-one matching of 8-connected components.
+
+    A prediction--target edge is legal only when its Euclidean centroid
+    distance is *strictly* smaller than ``centroid_radius``.  The assignment
+    objective is lexicographic: first maximize the number of legal matches,
+    then minimize their total centroid distance.  Dummy unmatched columns
+    make every target assignable, so an illegal edge can never consume a
+    prediction and block a legal match.
+
+    Match tuples retain the historical public convention
+    ``(target_index, prediction_index, distance)`` used by
+    :func:`match_connected_components`.
+    """
+
+    prediction_array, target_array, radius = _validate_new_component_arguments(
+        pred_mask,
+        target_mask,
+        centroid_radius=centroid_radius,
+        connectivity=connectivity,
+    )
+    prediction_label_map = measure.label(
+        prediction_array, connectivity=connectivity
+    )
+    target_label_map = measure.label(target_array, connectivity=connectivity)
+    prediction_regions = tuple(measure.regionprops(prediction_label_map))
+    target_regions = tuple(measure.regionprops(target_label_map))
+    num_prediction = len(prediction_regions)
+    num_target = len(target_regions)
+
+    if num_target == 0 or num_prediction == 0:
+        return ComponentMatchResult(
+            prediction_label_map=prediction_label_map,
+            target_label_map=target_label_map,
+            prediction_regions=prediction_regions,
+            target_regions=target_regions,
+            matches=(),
+            unmatched_prediction_indices=tuple(range(num_prediction)),
+            unmatched_target_indices=tuple(range(num_target)),
+        )
+
+    target_centroids = np.asarray(
+        [region.centroid for region in target_regions], dtype=np.float64
+    )
+    prediction_centroids = np.asarray(
+        [region.centroid for region in prediction_regions], dtype=np.float64
+    )
+    distances = np.linalg.norm(
+        target_centroids[:, None, :] - prediction_centroids[None, :, :],
+        axis=2,
+    )
+    legal = distances < radius
+
+    # Normalize legal distances to [0, 1).  One extra match then improves the
+    # objective by ``unmatched_cost`` while the total possible distance change
+    # is smaller than ``max_cardinality``.  This realizes the required
+    # maximum-cardinality/minimum-distance lexicographic objective without
+    # overflow for large, but finite, radius values.
+    max_cardinality = min(num_target, num_prediction)
+    unmatched_cost = float(max_cardinality + 1)
+    illegal_cost = float((num_target + 1) * (max_cardinality + 2))
+    cost = np.full(
+        (num_target, num_prediction + num_target),
+        unmatched_cost,
+        dtype=np.float64,
+    )
+    cost[:, :num_prediction] = np.where(
+        legal,
+        distances / radius,
+        illegal_cost,
+    )
+    row_indices, column_indices = linear_sum_assignment(cost)
+
+    matches = []
+    matched_predictions = set()
+    matched_targets = set()
+    for target_index, column_index in zip(row_indices, column_indices):
+        prediction_index = int(column_index)
+        target_index = int(target_index)
+        if prediction_index >= num_prediction:
+            continue
+        # This guard is deliberately independent of the numeric sentinel.
+        if not bool(legal[target_index, prediction_index]):
+            raise RuntimeError("Hungarian solver selected an illegal component edge")
+        matches.append(
+            (
+                target_index,
+                prediction_index,
+                float(distances[target_index, prediction_index]),
+            )
+        )
+        matched_targets.add(target_index)
+        matched_predictions.add(prediction_index)
+
+    matches.sort(key=lambda item: (item[0], item[1]))
+    return ComponentMatchResult(
+        prediction_label_map=prediction_label_map,
+        target_label_map=target_label_map,
+        prediction_regions=prediction_regions,
+        target_regions=target_regions,
+        matches=tuple(matches),
+        unmatched_prediction_indices=tuple(
+            index
+            for index in range(num_prediction)
+            if index not in matched_predictions
+        ),
+        unmatched_target_indices=tuple(
+            index for index in range(num_target) if index not in matched_targets
+        ),
+    )
+
+
+def evaluate_component_curve(
+    logits_or_probs,
+    target,
+    thresholds,
+    *,
+    input_semantics,
+    matching="hungarian",
+    centroid_radius=3.0,
+    connectivity=2,
+):
+    """Evaluate a single sample's component Pd/FA threshold curve.
+
+    ``input_semantics`` is mandatory.  With ``"logits"``, both the input and
+    thresholds are logits and no sigmoid is applied.  With
+    ``"probabilities"``, values and thresholds must lie in ``[0, 1]``.
+    Masks use the repository's strict ``score > threshold`` convention.
+
+    ``matching`` selects either the untouched target-order-dependent
+    ``"legacy"`` rule or the order-invariant ``"hungarian"`` rule.  False
+    alarm is unmatched prediction *area fraction*, matching ``PD_FA`` before
+    its conventional per-million scaling.
+    """
+
+    scores = _finite_2d_array(logits_or_probs, name="logits_or_probs")
+    target_array = _binary_2d_array(target, name="target")
+    if scores.shape != target_array.shape:
+        raise ValueError("logits_or_probs and target shapes must match")
+    if input_semantics not in {"logits", "probabilities"}:
+        raise ValueError("input_semantics must be 'logits' or 'probabilities'")
+    if matching not in {"legacy", "hungarian"}:
+        raise ValueError("matching must be 'legacy' or 'hungarian'")
+    # Validate radius/connectivity even for an all-empty threshold mask.
+    _validate_new_component_arguments(
+        np.zeros_like(target_array),
+        target_array,
+        centroid_radius=centroid_radius,
+        connectivity=connectivity,
+    )
+    if input_semantics == "probabilities" and not bool(
+        np.all((scores >= 0.0) & (scores <= 1.0))
+    ):
+        raise ValueError("probability inputs must lie in [0, 1]")
+
+    if isinstance(thresholds, torch.Tensor):
+        thresholds = thresholds.detach().cpu().numpy()
+    try:
+        threshold_array = np.asarray(thresholds, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("thresholds must be a non-empty 1-D finite sequence") from exc
+    if threshold_array.ndim != 1 or threshold_array.size == 0:
+        raise ValueError("thresholds must be a non-empty 1-D finite sequence")
+    if not bool(np.all(np.isfinite(threshold_array))):
+        raise ValueError("thresholds must contain only finite values")
+    if input_semantics == "probabilities" and not bool(
+        np.all((threshold_array >= 0.0) & (threshold_array <= 1.0))
+    ):
+        raise ValueError("probability thresholds must lie in [0, 1]")
+
+    curve = []
+    image_area = int(scores.shape[0] * scores.shape[1])
+    for threshold in threshold_array:
+        prediction_mask = scores > float(threshold)
+        if matching == "legacy":
+            component_match = match_connected_components(
+                prediction_mask,
+                target_array,
+                max_centroid_distance=centroid_radius,
+                connectivity=connectivity,
+            )
+        else:
+            component_match = match_components_hungarian(
+                prediction_mask,
+                target_array,
+                centroid_radius=centroid_radius,
+                connectivity=connectivity,
+            )
+        num_target = len(component_match.target_regions)
+        unmatched_area = int(
+            sum(
+                component_match.prediction_regions[index].area
+                for index in component_match.unmatched_prediction_indices
+            )
+        )
+        detection_probability = (
+            float(len(component_match.matches)) / float(num_target)
+            if num_target
+            else 0.0
+        )
+        false_alarm_fraction = float(unmatched_area) / float(image_area)
+        curve.append(
+            {
+                "threshold": float(threshold),
+                "pd": detection_probability,
+                "fa": false_alarm_fraction,
+                "matched_components": len(component_match.matches),
+                "target_components": num_target,
+                "prediction_components": len(
+                    component_match.prediction_regions
+                ),
+                "unmatched_target_components": len(
+                    component_match.unmatched_target_indices
+                ),
+                "unmatched_prediction_components": len(
+                    component_match.unmatched_prediction_indices
+                ),
+                "unmatched_prediction_area": unmatched_area,
+            }
+        )
+    return curve
 
 class ROCMetric():
     """Computes pixAcc and mIoU metric scores

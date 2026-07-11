@@ -26,6 +26,7 @@ from model.dea_shared_discrepancy_stencil import (
     SharedDiscrepancyStencilMSHNet,
 )
 from model.loss import SLSIoULoss
+from model.mshnet_checkpoint import strip_legacy_dea_lite_head
 from utils.data import IRSTD_Dataset
 from utils.metric import PD_FA
 
@@ -240,6 +241,7 @@ def main() -> None:
         **common_loader,
     )
 
+    state_dict = strip_legacy_dea_lite_head(state_dict)
     model = SharedDiscrepancyStencilMSHNet(
         args.input_channels,
         max_l1=args.max_l1,
@@ -247,9 +249,6 @@ def main() -> None:
     ).to(device)
     incompatible = model.load_state_dict(state_dict, strict=False)
     allowed_missing = {"stencil.theta"}
-    allowed_missing.update(
-        key for key in incompatible.missing_keys if key.startswith("decidability_head.")
-    )
     if set(incompatible.missing_keys) - allowed_missing or incompatible.unexpected_keys:
         raise RuntimeError(
             "incompatible checkpoint: missing=%s unexpected=%s"

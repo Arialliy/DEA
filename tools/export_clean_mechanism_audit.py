@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model.dea_scale_interaction_exchange import ScaleInteractionExchangeMSHNet
+from model.mshnet_checkpoint import strip_legacy_dea_lite_head
 from tools.finalize_clean_baselines import (
     EXPECTED_EPOCHS,
     OUTPUT_JSON as BASELINE_SUMMARY_JSON,
@@ -665,7 +666,7 @@ def main() -> int:
         a.input_channels, alpha=1, active_stages=(0,), anchor_mode="mean",
         freeze_bn_statistics=True,
     )
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(strip_legacy_dea_lite_head(state), strict=True)
     model.requires_grad_(False).to(device).eval()
 
     out = Path(a.output_dir).resolve()

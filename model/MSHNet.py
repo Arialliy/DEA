@@ -65,8 +65,17 @@ class ResNet(nn.Module):
         return out
 
 class MSHNet(nn.Module):
-    def __init__(self, input_channels, block=ResNet):
+    def __init__(
+        self,
+        input_channels,
+        block=ResNet,
+        *,
+        enable_dea_lite=False,
+    ):
         super().__init__()
+        if not isinstance(enable_dea_lite, bool):
+            raise TypeError("enable_dea_lite must be a bool")
+        self.enable_dea_lite = enable_dea_lite
         param_channels = [16, 32, 64, 128, 256]
         param_blocks = [2, 2, 2, 2]
         self.pool = nn.MaxPool2d(2, 2)
@@ -95,11 +104,12 @@ class MSHNet(nn.Module):
         self.output_3 = nn.Conv2d(param_channels[3], 1, 1)
 
         self.final = nn.Conv2d(4, 1, 3, 1, 1)
-        self.decidability_head = nn.Sequential(
-            nn.Conv2d(7, 8, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(8, 1, kernel_size=1)
-        )
+        if self.enable_dea_lite:
+            self.decidability_head = nn.Sequential(
+                nn.Conv2d(7, 8, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(8, 1, kernel_size=1),
+            )
 
 
     def _make_layer(self, in_channels, out_channels, block, block_num=1):
@@ -110,6 +120,11 @@ class MSHNet(nn.Module):
         return nn.Sequential(*layer)
 
     def build_dea_lite_outputs(self, scale_logits, z_full, detach_evidence=False):
+        if not self.enable_dea_lite or not hasattr(self, "decidability_head"):
+            raise RuntimeError(
+                "DEA-lite outputs require MSHNet(enable_dea_lite=True)"
+            )
+
         if detach_evidence:
             cf_scale_logits = scale_logits.detach()
             dec_scale_logits = scale_logits.detach()
@@ -161,6 +176,11 @@ class MSHNet(nn.Module):
         }
 
     def forward(self, x, warm_flag, return_dea=False, dea_detach_evidence=False):
+        if return_dea and not self.enable_dea_lite:
+            raise RuntimeError(
+                "return_dea=True requires MSHNet(enable_dea_lite=True)"
+            )
+
         x_e0 = self.encoder_0(self.conv_init(x))
         x_e1 = self.encoder_1(self.pool(x_e0))
         x_e2 = self.encoder_2(self.pool(x_e1))

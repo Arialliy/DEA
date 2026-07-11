@@ -25,6 +25,7 @@ from model.omm_flow import (
     instance_balanced_logistic_risk,
     omm2d_identity_risk,
 )
+from model.mshnet_checkpoint import strip_legacy_dea_lite_head
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -35,6 +36,7 @@ import random
 import numpy as np
 import json
 import hashlib
+import math
 
 PROJECT_DIR = osp.dirname(osp.abspath(__file__))
 DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
@@ -48,6 +50,8 @@ MSHNET_OBJECTIVES = (
 )
 MSHNET_SIDE_SUPERVISION = ('canonical', 'none')
 MSHNET_TRAIN_GRAPHS = ('canonical_warm', 'full')
+LOCATION_LOSS_MODES = ('legacy', 'none', 'mass_polar', 'mass_cartesian')
+SIDE_LOCATION_LOSS_MODES = ('same',) + LOCATION_LOSS_MODES
 
 
 def is_dea_main_model(model_type):
@@ -69,6 +73,69 @@ def is_noncanonical_mshnet_training(args):
         objective != 'sls'
         or side_supervision != 'canonical'
         or train_graph != 'canonical_warm'
+    )
+
+def get_location_training_semantics(args):
+    return (
+        getattr(args, 'location_loss', 'legacy'),
+        getattr(args, 'side_location_loss', 'same'),
+        float(getattr(args, 'lambda_location', 1.0)),
+    )
+
+def is_noncanonical_location_training(args):
+    location_loss, side_location_loss, lambda_location = (
+        get_location_training_semantics(args)
+    )
+    return (
+        location_loss != 'legacy'
+        or side_location_loss != 'same'
+        or lambda_location != 1.0
+    )
+
+def get_dea_lite_training_semantics(args):
+    return (
+        float(getattr(args, 'dea_lambda_single', 0.0)),
+        float(getattr(args, 'dea_lambda_dec', 0.0)),
+        float(getattr(args, 'dea_lambda_empty', 0.0)),
+        float(getattr(args, 'dea_tau', 0.5)),
+        int(getattr(args, 'dea_ramp_epochs', 0)),
+        bool(getattr(args, 'dea_detach_evidence', False)),
+    )
+
+def dea_lite_enabled(args):
+    lambda_single, lambda_dec, lambda_empty, _, _, _ = (
+        get_dea_lite_training_semantics(args)
+    )
+    return (
+        getattr(args, 'model_type', 'mshnet') == 'mshnet'
+        and any(value > 0.0 for value in (
+            lambda_single,
+            lambda_dec,
+            lambda_empty,
+        ))
+    )
+
+def checkpoint_metadata_dea_lite_enabled(metadata):
+    try:
+        inferred = any(
+            float(metadata.get(key, 0.0)) > 0.0
+            for key in (
+                'dea_lambda_single',
+                'dea_lambda_dec',
+                'dea_lambda_empty',
+            )
+        )
+    except (TypeError, ValueError):
+        # Malformed legacy metadata must enter strict validation, never the
+        # canonical early-return path.
+        return True
+    return bool(metadata.get('dea_lite_enabled', inferred))
+
+def is_noncanonical_plain_mshnet_experiment(args):
+    return (
+        is_noncanonical_mshnet_training(args)
+        or is_noncanonical_location_training(args)
+        or dea_lite_enabled(args)
     )
 
 def str2bool(value):
@@ -123,6 +190,18 @@ def seed_worker(worker_id):
 def validate_args(args):
     if getattr(args, "mode", "train") not in ("train", "test"):
         raise ValueError("--mode must be train or test.")
+
+    dea_lite_semantics = get_dea_lite_training_semantics(args)
+    lite_lambdas = dea_lite_semantics[:3]
+    if any(not math.isfinite(value) or value < 0.0 for value in lite_lambdas):
+        raise ValueError("DEA-lite lambdas must be finite and non-negative.")
+    dea_tau = dea_lite_semantics[3]
+    if not math.isfinite(dea_tau) or not 0.0 < dea_tau < 1.0:
+        raise ValueError("--dea-tau must be finite and in (0, 1).")
+    if dea_lite_semantics[4] < 0:
+        raise ValueError("--dea-ramp-epochs must be non-negative.")
+    if any(value > 0.0 for value in lite_lambdas) and args.model_type != 'mshnet':
+        raise ValueError("DEA-lite losses require --model-type mshnet.")
 
     if args.model_type == "dea_integrated":
         if args.if_checkpoint and args.init_from_baseline:
@@ -288,6 +367,31 @@ def validate_args(args):
     if train_graph not in MSHNET_TRAIN_GRAPHS:
         raise ValueError("unknown --mshnet-train-graph: %s" % train_graph)
 
+    location_loss, side_location_loss, lambda_location = (
+        get_location_training_semantics(args)
+    )
+    if location_loss not in LOCATION_LOSS_MODES:
+        raise ValueError("unknown --location-loss: %s" % location_loss)
+    if side_location_loss not in SIDE_LOCATION_LOSS_MODES:
+        raise ValueError(
+            "unknown --side-location-loss: %s" % side_location_loss
+        )
+    if not math.isfinite(lambda_location) or lambda_location < 0.0:
+        raise ValueError("--lambda-location must be finite and non-negative")
+    if is_noncanonical_location_training(args):
+        if args.model_type != 'mshnet':
+            raise ValueError(
+                "location-loss controls require --model-type mshnet"
+            )
+        if objective != 'sls':
+            raise ValueError(
+                "location-loss controls require --mshnet-objective sls"
+            )
+        if dea_lite_enabled(args):
+            raise ValueError(
+                "location-loss controls and DEA-lite must not be combined"
+            )
+
     if is_noncanonical_mshnet_training(args) and args.model_type != 'mshnet':
         raise ValueError(
             "non-canonical MSHNet objective/side/graph controls require "
@@ -362,6 +466,29 @@ def get_method_name(args):
         if version == "v5":
             return "FullDEA-v5-CRR-HT"
         return "FullDEA-v3-TPS"
+    if args.model_type == "mshnet" and is_noncanonical_location_training(args):
+        location_loss, side_location_loss, lambda_location = (
+            get_location_training_semantics(args)
+        )
+        _, side_supervision, train_graph = get_mshnet_training_semantics(args)
+        lambda_name = ("%g" % lambda_location).replace("-", "m").replace(".", "p")
+        supervision_name = (
+            'DeepSupervision'
+            if side_supervision == 'canonical'
+            else 'FinalOnly'
+        )
+        graph_name = (
+            'CanonicalWarm'
+            if train_graph == 'canonical_warm'
+            else 'FullGraph'
+        )
+        return "MSHNet-SLS-%s-%s-Loc-%s-SideLoc-%s-Lambda%s" % (
+            supervision_name,
+            graph_name,
+            location_loss,
+            side_location_loss,
+            lambda_name,
+        )
     if args.model_type == "mshnet" and is_noncanonical_mshnet_training(args):
         objective, side_supervision, train_graph = get_mshnet_training_semantics(args)
         if objective == 'omm2d_identity':
@@ -371,11 +498,7 @@ def get_method_name(args):
         side_name = 'DeepSupervision' if side_supervision == 'canonical' else 'FinalOnly'
         graph_name = 'CanonicalWarm' if train_graph == 'canonical_warm' else 'FullGraph'
         return "MSHNet-SLS-%s-%s" % (side_name, graph_name)
-    if (
-        args.dea_lambda_single > 0
-        or args.dea_lambda_dec > 0
-        or args.dea_lambda_empty > 0
-    ):
+    if dea_lite_enabled(args):
         return "DEA-lite"
     if getattr(args, "init_from_baseline", ""):
         return "MSHNet-Continued"
@@ -406,6 +529,11 @@ def get_method_metadata(args):
         "mshnet_objective": mshnet_objective,
         "mshnet_side_supervision": mshnet_side_supervision,
         "mshnet_train_graph": mshnet_train_graph,
+        "location_loss": getattr(args, "location_loss", "legacy"),
+        "side_location_loss": getattr(args, "side_location_loss", "same"),
+        "lambda_location": float(getattr(args, "lambda_location", 1.0)),
+        "location_loss_version": "global_mass_location_v1",
+        "warm_epoch": int(getattr(args, "warm_epoch", 5)),
         "instance_objective_version": "v1",
         "omm2d_version": (
             "identity_v1" if mshnet_objective == "omm2d_identity" else ""
@@ -431,6 +559,13 @@ def get_method_metadata(args):
         "dea_lambda_single": float(args.dea_lambda_single),
         "dea_lambda_dec": float(args.dea_lambda_dec),
         "dea_lambda_empty": float(args.dea_lambda_empty),
+        "dea_lite_enabled": bool(dea_lite_enabled(args)),
+        "dea_lite_head_version": "decidability_7x8x1_v1",
+        "dea_tau": float(getattr(args, "dea_tau", 0.5)),
+        "dea_ramp_epochs": int(getattr(args, "dea_ramp_epochs", 0)),
+        "dea_detach_evidence": bool(
+            getattr(args, "dea_detach_evidence", False)
+        ),
         "integrated_route_channels": int(getattr(args, "integrated_route_channels", 16)),
         "integrated_route_temperature": float(getattr(args, "integrated_route_temperature", 1.0)),
         "integrated_routing_mode": getattr(args, "integrated_routing_mode", ""),
@@ -507,6 +642,21 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=400)
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--warm-epoch', type=int, default=5)
+    parser.add_argument(
+        '--location-loss',
+        type=str,
+        default='legacy',
+        choices=LOCATION_LOSS_MODES,
+        help='Location term used inside SLS after warm-up.',
+    )
+    parser.add_argument(
+        '--side-location-loss',
+        type=str,
+        default='same',
+        choices=SIDE_LOCATION_LOSS_MODES,
+        help='Location term for MSHNet side heads; same follows --location-loss.',
+    )
+    parser.add_argument('--lambda-location', type=float, default=1.0)
     parser.add_argument(
         '--mshnet-objective',
         type=str,
@@ -797,7 +947,7 @@ class Trainer(object):
                 legacy_influence_numerics=args.predictive_legacy_numerics,
             )
         else:
-            model = MSHNet(3)
+            model = MSHNet(3, enable_dea_lite=dea_lite_enabled(args))
 
         if args.multi_gpus and torch.cuda.device_count() > 1:
             device_ids = self.parse_gpu_ids(args.gpu_ids)
@@ -809,6 +959,12 @@ class Trainer(object):
         if args.mode == 'train' and args.init_from_baseline and not args.if_checkpoint:
             baseline = load_torch_file(args.init_from_baseline)
             state_dict = self.extract_state_dict(baseline)
+            if args.model_type == 'mshnet' and dea_lite_enabled(args):
+                # Historical clean checkpoints contain an unused random head.
+                # DEA-lite must initialize its opt-in head from the current
+                # paired seed, not inherit those semantically meaningless
+                # tensors from a contaminated baseline state.
+                state_dict = strip_legacy_dea_lite_head(state_dict)
             if is_cev_control(args.model_type):
                 allowed_missing = CounterfactualVetoMSHNet.BASELINE_MISSING_PREFIXES
                 allowed_unexpected = (
@@ -821,12 +977,16 @@ class Trainer(object):
                 allowed_missing = DEAMSHNet.BASELINE_MISSING_PREFIXES
                 allowed_unexpected = DEAMSHNet.BASELINE_UNEXPECTED_PREFIXES
             elif args.model_type == "full_dea":
-                allowed_missing = ("full_dea_head.", "decidability_head.")
+                allowed_missing = ("full_dea_head.",)
                 allowed_unexpected = ()
             else:
-                # The pristine public MSHNet checkpoint predates the optional
-                # DEA-lite head present in this repository.
-                allowed_missing = ("decidability_head.",)
+                # Pure baselines can initialize the explicit optional head;
+                # resume/test remains strict below.
+                allowed_missing = (
+                    ("decidability_head.",)
+                    if dea_lite_enabled(args)
+                    else ()
+                )
                 allowed_unexpected = ()
             self.load_model_state_partial(
                 state_dict,
@@ -837,7 +997,10 @@ class Trainer(object):
         self.optimizer = Adagrad(filter(lambda p: p.requires_grad, self.model.parameters()), lr=args.lr)
 
         self.down = nn.MaxPool2d(2, 2)
-        self.loss_fun = SLSIoULoss()
+        self.loss_fun = SLSIoULoss(
+            location_mode=getattr(args, 'location_loss', 'legacy'),
+            lambda_location=float(getattr(args, 'lambda_location', 1.0)),
+        )
         self.PD_FA = PD_FA(1, 10, args.base_size)
         self.mIoU = mIoU(1)
         self.ROC  = ROCMetric(1, 10)
@@ -877,7 +1040,11 @@ class Trainer(object):
                     try:
                         self.optimizer.load_state_dict(checkpoint['optimizer'])
                     except (ValueError, RuntimeError) as exc:
-                        print('skip optimizer state: %s' % exc)
+                        raise RuntimeError(
+                            'optimizer state is incompatible; resume with '
+                            '--reset-optimizer true only after verifying the '
+                            'checkpoint/model semantics: %s' % exc
+                        ) from exc
                 self.set_optimizer_lr(args.lr)
                 self.start_epoch = checkpoint.get('epoch', -1) + 1
                 self.best_iou = float(checkpoint.get('best_iou', checkpoint.get('iou', 0.0)))
@@ -1017,7 +1184,20 @@ class Trainer(object):
                 or checkpoint_metadata.get(
                     'mshnet_train_graph', 'canonical_warm'
                 ) != 'canonical_warm'
+                or checkpoint_metadata.get(
+                    'location_loss', 'legacy'
+                ) != 'legacy'
+                or checkpoint_metadata.get(
+                    'side_location_loss', 'same'
+                ) != 'same'
+                or float(checkpoint_metadata.get(
+                    'lambda_location', 1.0
+                )) != 1.0
+                or checkpoint_metadata_dea_lite_enabled(checkpoint_metadata)
             )
+        )
+        checkpoint_dea_lite = checkpoint_metadata_dea_lite_enabled(
+            checkpoint_metadata
         )
         requires_metadata = (
             self.args.model_type == 'dea_integrated'
@@ -1025,7 +1205,9 @@ class Trainer(object):
             or is_cev_control(self.args.model_type)
             or (
                 self.args.model_type == 'mshnet'
-                and is_noncanonical_mshnet_training(self.args)
+                and (
+                    is_noncanonical_plain_mshnet_experiment(self.args)
+                )
             )
             or checkpoint_noncanonical_mshnet
         )
@@ -1055,6 +1237,25 @@ class Trainer(object):
                 'instance_miss_reduction',
                 'test_split_sha256',
             )
+            if expected['mshnet_objective'] == 'sls':
+                semantic_keys = semantic_keys + (
+                    'location_loss',
+                    'side_location_loss',
+                    'lambda_location',
+                    'location_loss_version',
+                    'warm_epoch',
+                )
+            if dea_lite_enabled(self.args) or checkpoint_dea_lite:
+                semantic_keys = semantic_keys + (
+                    'dea_lite_enabled',
+                    'dea_lite_head_version',
+                    'dea_lambda_single',
+                    'dea_lambda_dec',
+                    'dea_lambda_empty',
+                    'dea_tau',
+                    'dea_ramp_epochs',
+                    'dea_detach_evidence',
+                )
         elif is_cev_control(self.args.model_type):
             semantic_keys = (
                 'model_type',
@@ -1150,27 +1351,27 @@ class Trainer(object):
         )
 
     def load_model_state(self, state_dict):
+        target_model = (
+            self.model.module
+            if isinstance(self.model, nn.DataParallel)
+            else self.model
+        )
+        if state_dict and all(key.startswith('module.') for key in state_dict):
+            state_dict = {
+                key[len('module.'):]: value for key, value in state_dict.items()
+            }
+        target_has_dea_lite = any(
+            key.startswith('decidability_head.')
+            for key in target_model.state_dict()
+        )
+        if not target_has_dea_lite:
+            state_dict = strip_legacy_dea_lite_head(state_dict)
         try:
-            self.model.load_state_dict(state_dict)
-            return
-        except RuntimeError:
-            pass
-
-        if isinstance(self.model, nn.DataParallel):
-            try:
-                self.model.module.load_state_dict(state_dict)
-                return
-            except RuntimeError:
-                pass
-
-        has_module_prefix = all(key.startswith('module.') for key in state_dict.keys())
-        if has_module_prefix:
-            state_dict = {key[len('module.'):]: value for key, value in state_dict.items()}
-            target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-            target_model.load_state_dict(state_dict)
-            return
-
-        raise RuntimeError('Failed to load model state_dict.')
+            target_model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                'Failed to load model state_dict: %s' % exc
+            ) from exc
 
     def load_model_state_partial(
         self,
@@ -1181,6 +1382,13 @@ class Trainer(object):
         target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         if state_dict and all(key.startswith('module.') for key in state_dict.keys()):
             state_dict = {key[len('module.'):]: value for key, value in state_dict.items()}
+
+        target_has_dea_lite = any(
+            key.startswith('decidability_head.')
+            for key in target_model.state_dict()
+        )
+        if not target_has_dea_lite:
+            state_dict = strip_legacy_dea_lite_head(state_dict)
 
         missing, unexpected = target_model.load_state_dict(state_dict, strict=False)
         bad_missing = [
@@ -1587,17 +1795,33 @@ class Trainer(object):
             )
             return result['loss'], result
 
-        loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
+        location_mode = getattr(self.args, 'location_loss', 'legacy')
+        loss = self.loss_fun(
+            pred,
+            labels,
+            self.warm_epoch,
+            epoch,
+            location_mode=location_mode,
+        )
         side_supervision = getattr(
             self.args, 'mshnet_side_supervision', 'canonical'
         )
         if side_supervision == 'canonical':
+            side_location_mode = getattr(
+                self.args, 'side_location_loss', 'same'
+            )
+            if side_location_mode == 'same':
+                side_location_mode = location_mode
             labels_for_scale = labels
             for j in range(len(masks)):
                 if j > 0:
                     labels_for_scale = self.down(labels_for_scale)
                 loss = loss + self.loss_fun(
-                    masks[j], labels_for_scale, self.warm_epoch, epoch
+                    masks[j],
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                    location_mode=side_location_mode,
                 )
             loss = loss / (len(masks) + 1)
         return loss, None
@@ -2021,7 +2245,7 @@ class Trainer(object):
                     self.best_iou = mean_IoU
                     if not (
                         self.args.model_type == 'mshnet'
-                        and is_noncanonical_mshnet_training(self.args)
+                        and is_noncanonical_plain_mshnet_experiment(self.args)
                     ):
                         torch.save(
                             self.model.state_dict(),
@@ -2060,7 +2284,7 @@ class Trainer(object):
 
                     if not (
                         self.args.model_type == 'mshnet'
-                        and is_noncanonical_mshnet_training(self.args)
+                        and is_noncanonical_plain_mshnet_experiment(self.args)
                     ):
                         torch.save(
                             self.model.state_dict(),

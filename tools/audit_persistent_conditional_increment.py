@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from model.dea_persistent_conditional_increment import (
     PersistentConditionalIncrementMSHNet,
 )
+from model.mshnet_checkpoint import strip_legacy_dea_lite_head
 from utils.data import IRSTD_Dataset
 from utils.metric import PD_FA
 
@@ -273,6 +274,7 @@ def main() -> None:
     )
 
     state_dict, checkpoint_metadata = load_checkpoint(args.checkpoint)
+    state_dict = strip_legacy_dea_lite_head(state_dict)
     model = PersistentConditionalIncrementMSHNet(
         args.input_channels,
         alpha=1.0,
@@ -281,10 +283,7 @@ def main() -> None:
         freeze_bn_statistics=True,
     ).to(device).eval()
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {
-        key for key in incompatible.missing_keys if key.startswith("decidability_head.")
-    }
-    disallowed_missing = set(incompatible.missing_keys) - allowed_missing
+    disallowed_missing = set(incompatible.missing_keys)
     if disallowed_missing or incompatible.unexpected_keys:
         raise RuntimeError(
             "incompatible checkpoint: missing=%s unexpected=%s"

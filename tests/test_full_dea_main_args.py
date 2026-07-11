@@ -12,7 +12,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from main import Trainer, get_method_metadata, get_method_name, get_run_folder_name, validate_args
+from main import (
+    Trainer,
+    dea_lite_enabled,
+    get_method_metadata,
+    get_method_name,
+    get_run_folder_name,
+    is_noncanonical_plain_mshnet_experiment,
+    validate_args,
+)
 from model.MSHNet import MSHNet
 from model.dea_mshnet import DEAMSHNet
 from model.full_dea_mshnet import FullDEAMSHNet
@@ -24,11 +32,18 @@ def make_args(**kwargs):
         mshnet_objective="sls",
         mshnet_side_supervision="canonical",
         mshnet_train_graph="canonical_warm",
+        location_loss="legacy",
+        side_location_loss="same",
+        lambda_location=1.0,
+        warm_epoch=5,
         init_from_baseline="",
         if_checkpoint=False,
         dea_lambda_single=0.0,
         dea_lambda_dec=0.0,
         dea_lambda_empty=0.0,
+        dea_tau=0.5,
+        dea_ramp_epochs=0,
+        dea_detach_evidence=False,
         full_dea_lambda=1.0,
         full_dea_version="v3",
         full_dea_ramp_epochs=30,
@@ -74,6 +89,66 @@ def test_full_dea_rejects_dea_lite_lambdas() -> None:
     args = make_args(model_type="full_dea", dea_lambda_single=0.01)
     with pytest.raises(ValueError):
         validate_args(args)
+
+
+def test_dea_lite_is_explicit_and_checkpoint_semantics_are_fail_closed() -> None:
+    args = validate_args(make_args(
+        dea_lambda_single=0.2,
+        dea_tau=0.45,
+        dea_ramp_epochs=3,
+        dea_detach_evidence=True,
+    ))
+    assert dea_lite_enabled(args)
+    assert is_noncanonical_plain_mshnet_experiment(args)
+    assert get_method_name(args) == "DEA-lite"
+    metadata = get_method_metadata(args)
+    assert metadata["dea_lite_enabled"] is True
+    assert metadata["dea_lite_head_version"] == "decidability_7x8x1_v1"
+    assert metadata["dea_tau"] == 0.45
+    assert metadata["dea_ramp_epochs"] == 3
+    assert metadata["dea_detach_evidence"] is True
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer, {"method_meta": metadata}, check_split_hashes=False
+    )
+
+    trainer.args = validate_args(make_args())
+    with pytest.raises(RuntimeError, match="dea_lite_enabled"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": metadata}, check_split_hashes=False
+        )
+
+
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf")])
+def test_dea_lite_lambdas_must_be_finite_and_nonnegative(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        validate_args(make_args(dea_lambda_single=value))
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0, float("nan"), float("inf")])
+def test_dea_lite_tau_must_be_a_finite_probability(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and in"):
+        validate_args(make_args(dea_tau=value))
+
+
+def test_trainer_strict_load_filters_only_exact_legacy_unused_head() -> None:
+    torch.manual_seed(20260712)
+    legacy = MSHNet(3, enable_dea_lite=True)
+    pure = MSHNet(3)
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = pure
+
+    Trainer.load_model_state(trainer, legacy.state_dict())
+
+    for key, value in pure.state_dict().items():
+        assert torch.equal(value, legacy.state_dict()[key]), key
+
+    enabled = MSHNet(3, enable_dea_lite=True)
+    trainer.model = enabled
+    with pytest.raises(RuntimeError, match="Failed to load"):
+        Trainer.load_model_state(trainer, pure.state_dict())
 
 
 def test_full_dea_rejects_invalid_safe_kernel() -> None:
@@ -261,6 +336,80 @@ def test_default_mshnet_training_semantics_remain_canonical() -> None:
     assert Trainer.get_forward_tag(trainer, epoch=6) is True
 
 
+def test_mass_normalized_location_controls_are_named_and_fail_closed() -> None:
+    args = validate_args(make_args(
+        location_loss="mass_cartesian",
+        side_location_loss="none",
+        lambda_location=0.5,
+    ))
+    assert get_method_name(args) == (
+        "MSHNet-SLS-DeepSupervision-CanonicalWarm-"
+        "Loc-mass_cartesian-SideLoc-none-Lambda0p5"
+    )
+    assert is_noncanonical_plain_mshnet_experiment(args)
+    metadata = get_method_metadata(args)
+    assert metadata["location_loss"] == "mass_cartesian"
+    assert metadata["side_location_loss"] == "none"
+    assert metadata["lambda_location"] == 0.5
+    assert metadata["location_loss_version"] == "global_mass_location_v1"
+
+    with pytest.raises(ValueError, match="require --model-type mshnet"):
+        validate_args(make_args(
+            model_type="full_dea",
+            location_loss="mass_cartesian",
+        ))
+    with pytest.raises(ValueError, match="require --mshnet-objective sls"):
+        validate_args(make_args(
+            mshnet_objective="omm2d_identity",
+            mshnet_side_supervision="none",
+            mshnet_train_graph="full",
+            location_loss="mass_cartesian",
+        ))
+
+
+def test_location_checkpoint_metadata_rejects_semantic_mismatch() -> None:
+    args = validate_args(make_args(location_loss="mass_polar"))
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    metadata = get_method_metadata(args)
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer, {"method_meta": metadata}, check_split_hashes=False
+    )
+
+    mismatched = dict(metadata)
+    mismatched["location_loss"] = "mass_cartesian"
+    with pytest.raises(RuntimeError, match="location_loss"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": mismatched}, check_split_hashes=False
+        )
+
+    warm_mismatch = dict(metadata)
+    warm_mismatch["warm_epoch"] = 7
+    with pytest.raises(RuntimeError, match="warm_epoch"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": warm_mismatch}, check_split_hashes=False
+        )
+
+
+def test_location_method_name_encodes_graph_and_supervision() -> None:
+    canonical_graph = validate_args(make_args(location_loss="mass_cartesian"))
+    full_final_only = validate_args(make_args(
+        location_loss="mass_cartesian",
+        mshnet_side_supervision="none",
+        mshnet_train_graph="full",
+    ))
+    assert get_method_name(canonical_graph) != get_method_name(full_final_only)
+    assert "CanonicalWarm" in get_method_name(canonical_graph)
+    assert "FullGraph" in get_method_name(full_final_only)
+    assert "FinalOnly" in get_method_name(full_final_only)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_location_lambda_must_be_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        validate_args(make_args(lambda_location=value))
+
+
 def test_omm2d_training_semantics_are_fail_closed_and_named() -> None:
     args = validate_args(make_args(
         mshnet_objective="omm2d_identity",
@@ -278,6 +427,24 @@ def test_omm2d_training_semantics_are_fail_closed_and_named() -> None:
     trainer.args = args
     trainer.warm_epoch = 5
     assert Trainer.get_forward_tag(trainer, epoch=0) is True
+
+    # Location-loss fields are irrelevant to replacement objectives.  Old
+    # OMM checkpoints created before the diagnostic location schema must stay
+    # readable when their actual instance-objective semantics agree.
+    legacy_metadata = dict(metadata)
+    for key in (
+        "location_loss",
+        "side_location_loss",
+        "lambda_location",
+        "location_loss_version",
+        "warm_epoch",
+    ):
+        legacy_metadata.pop(key)
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer,
+        {"method_meta": legacy_metadata},
+        check_split_hashes=False,
+    )
 
     with pytest.raises(ValueError, match="side-supervision none"):
         validate_args(make_args(

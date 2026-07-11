@@ -3,6 +3,9 @@ import numpy as np
 import  torch
 import torch.nn.functional as F
 from skimage import measure
+import math
+
+from model.location_losses import GlobalMassLocationLoss, legacy_location_loss
 
 
 def SoftIoULoss( pred, target):
@@ -40,11 +43,50 @@ def Dice( pred, target,warm_epoch=1, epoch=1, layer=0):
         return loss
 
 class SLSIoULoss(nn.Module):
-    def __init__(self):
+    VALID_LOCATION_MODES = (
+        "legacy",
+        "none",
+        "mass_polar",
+        "mass_cartesian",
+    )
+
+    def __init__(
+        self,
+        location_mode="legacy",
+        lambda_location=1.0,
+        return_breakdown=False,
+    ):
         super(SLSIoULoss, self).__init__()
+        if location_mode not in self.VALID_LOCATION_MODES:
+            raise ValueError("unknown location mode: %s" % location_mode)
+        if not math.isfinite(float(lambda_location)) or float(lambda_location) < 0.0:
+            raise ValueError("lambda_location must be finite and non-negative")
+        self.location_mode = location_mode
+        self.lambda_location = float(lambda_location)
+        self.return_breakdown = bool(return_breakdown)
+        self.mass_polar = GlobalMassLocationLoss(metric="polar")
+        self.mass_cartesian = GlobalMassLocationLoss(metric="cartesian")
 
+    def forward(
+        self,
+        pred_log,
+        target,
+        warm_epoch,
+        epoch,
+        with_shape=True,
+        *,
+        location_mode=None,
+        with_location=None,
+        return_breakdown=None,
+    ):
+        mode = self.location_mode if location_mode is None else location_mode
+        if mode not in self.VALID_LOCATION_MODES:
+            raise ValueError("unknown location mode: %s" % mode)
+        if with_location is None:
+            with_location = with_shape
+        if return_breakdown is None:
+            return_breakdown = self.return_breakdown
 
-    def forward(self, pred_log, target,warm_epoch, epoch, with_shape=True):
         pred = torch.sigmoid(pred_log)
         smooth = 0.0
 
@@ -61,44 +103,44 @@ class SLSIoULoss(nn.Module):
         
         loss = (intersection_sum + smooth) / \
                 (pred_sum + target_sum - intersection_sum  + smooth)       
-        lloss = LLoss(pred, target)
-
-        if epoch>warm_epoch:       
+        location_log = {}
+        if epoch>warm_epoch:
             siou_loss = alpha * loss
-            if with_shape:
-                loss = 1 - siou_loss.mean() + lloss
+            segmentation_loss = 1 - siou_loss.mean()
+            if not with_location or mode == "none":
+                location_loss = pred.new_zeros(())
+            elif mode == "legacy":
+                location_loss = legacy_location_loss(pred, target)
+            elif mode == "mass_polar":
+                location_loss, location_log = self.mass_polar(pred, target)
+            elif mode == "mass_cartesian":
+                location_loss, location_log = self.mass_cartesian(pred, target)
             else:
-                loss = 1 -siou_loss.mean()
+                raise AssertionError("unreachable location mode: %s" % mode)
+            loss = segmentation_loss + self.lambda_location * location_loss
         else:
-            loss = 1 - loss.mean()
-        return loss
+            # Preserve canonical MSHNet warm-up exactly: ordinary soft IoU only.
+            segmentation_loss = 1 - loss.mean()
+            location_loss = pred.new_zeros(())
+            loss = segmentation_loss
+
+        if not return_breakdown:
+            return loss
+        breakdown = {
+            "total": loss,
+            "segmentation": segmentation_loss.detach(),
+            "location": location_loss.detach(),
+            "location_weighted": (
+                self.lambda_location * location_loss
+            ).detach(),
+        }
+        breakdown.update(location_log)
+        return loss, breakdown
     
     
 
-def LLoss(pred, target):
-        h = pred.shape[2]
-        w = pred.shape[3]        
-        x_index = torch.arange(0, w, 1, device=pred.device, dtype=pred.dtype).view(1, 1, 1, w) / w
-        y_index = torch.arange(0, h, 1, device=pred.device, dtype=pred.dtype).view(1, 1, h, 1) / h
-        smooth = 1e-8
-
-        pred_centerx = (x_index * pred).mean(dim=(1, 2, 3))
-        pred_centery = (y_index * pred).mean(dim=(1, 2, 3))
-        target_centerx = (x_index * target).mean(dim=(1, 2, 3))
-        target_centery = (y_index * target).mean(dim=(1, 2, 3))
-
-        angle_loss = (4 / (torch.pi ** 2)) * torch.square(
-            torch.atan(pred_centery / (pred_centerx + smooth))
-            - torch.atan(target_centery / (target_centerx + smooth))
-        )
-
-        pred_length = torch.sqrt(pred_centerx * pred_centerx + pred_centery * pred_centery + smooth)
-        target_length = torch.sqrt(target_centerx * target_centerx + target_centery * target_centery + smooth)
-        length_loss = torch.minimum(pred_length, target_length) / (
-            torch.maximum(pred_length, target_length) + smooth
-        )
-
-        return (1 - length_loss + angle_loss).mean()
+# Historical public name retained for downstream imports and checkpoint-era tools.
+LLoss = legacy_location_loss
 
 
 class AverageMeter(object):

@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model.MSHNet import MSHNet
+from model.mshnet_checkpoint import strip_legacy_dea_lite_head
 from model.mshnet_evidence_view import forward_mshnet_evidence
 from utils.data import IRSTD_Dataset
 from utils.metric import PD_FA
@@ -101,7 +102,9 @@ def main() -> None:
         num_workers=args.num_workers,
     )
     model = MSHNet(args.input_channels).to(device).eval()
-    model.load_state_dict(load_state_dict(args.checkpoint))
+    model.load_state_dict(
+        strip_legacy_dea_lite_head(load_state_dict(args.checkpoint))
+    )
 
     names = [
         "baseline",
