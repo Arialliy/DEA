@@ -168,6 +168,23 @@ def fractional_project(mask, output_shape: tuple[int, int]) -> np.ndarray:
     return array
 
 
+def _fractional_project_many(
+    masks: tuple[np.ndarray, ...],
+    output_shape: tuple[int, int],
+) -> np.ndarray:
+    if not masks:
+        return np.empty((0, *output_shape), dtype=np.float64)
+    stacked = np.stack(
+        [_binary_mask(mask, name="mask") for mask in masks], axis=0
+    ).astype(np.float32)
+    tensor = torch.from_numpy(stacked)[:, None]
+    projected = F.interpolate(tensor, size=output_shape, mode="area")[:, 0]
+    array = projected.numpy().astype(np.float64, copy=False)
+    if not np.isfinite(array).all() or np.any(array < 0) or np.any(array > 1):
+        raise RuntimeError("batched area projection produced invalid occupancy")
+    return array
+
+
 def _select_background_indices(
     support: np.ndarray,
     guarded_targets: np.ndarray,
@@ -243,8 +260,16 @@ def project_geometry_controls(
         controls.guarded_target_mask, output_shape
     ) > 0
 
-    def make_footprint(mask: np.ndarray, *, key: str) -> ProjectedFootprint | None:
-        occupancy = fractional_project(mask, output_shape)
+    projected_masks = _fractional_project_many(
+        (controls.component_mask, *controls.translated_masks),
+        output_shape,
+    )
+
+    def make_footprint(
+        occupancy: np.ndarray,
+        *,
+        key: str,
+    ) -> ProjectedFootprint | None:
         support = occupancy > 0
         if not support.any():
             return None
@@ -266,7 +291,7 @@ def project_geometry_controls(
         )
 
     target = make_footprint(
-        controls.component_mask,
+        projected_masks[0],
         key=controls.sample_key + "\0target",
     )
     if target is None:
@@ -275,9 +300,9 @@ def project_geometry_controls(
     projected_controls = []
     seen = set()
     target_area = float(target.occupancy.sum())
-    for control_index, mask in enumerate(controls.translated_masks):
+    for control_index, occupancy in enumerate(projected_masks[1:]):
         footprint = make_footprint(
-            mask,
+            occupancy,
             key="%s\0control\0%d" % (controls.sample_key, control_index),
         )
         if footprint is None or not math.isclose(
