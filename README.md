@@ -31,10 +31,13 @@ Current evidence gates are conservative:
   are sample-size-vacuous at the frozen `1--20 FA/Mpix` risks; the generic
   operating-point risk-control route is therefore **NO-GO**.
 - Gate F nested Q0/Q1/Q2 grids are alternative-grid sensitivity checks only.
-  Exact unique-logit sweeps are conditional diagnostics and cannot reopen the
-  frozen E-1c decision or authorize training.
-- Gate G is direction search only. No representation-level method has been
-  authorized.
+  Gate F-1a finished **NO-GO**, so targeted/full unique-logit sweeps remain
+  unauthorized and cannot reopen the frozen E-1c decision.
+- Gate G0 adds a read-only component-frontier decomposition for separating
+  selection sensitivity, peak ordering, and component conversion limits.
+- OHR-MSHNet is the current frozen candidate design for an OR-consistent
+  multi-scale prediction head. It has no reported Gate 0--3 or performance
+  result yet and must not be described as a validated method.
 
 These are project-routing results, not paper novelty or performance claims.
 The governing definitions and latest status are documented in:
@@ -42,6 +45,7 @@ The governing definitions and latest status are documented in:
 - [North Star objective and Gate E positioning](MSHNet_North_Star_Objective_and_Gate_E_Positioning.md)
 - [Gate D/E audit plan and Gate F record](MSHNet_Gate_D_NoGo_and_Gate_E_Training_Credit_Audit_Plan.md)
 - [Gate F event-complete component-risk analysis](MSHNet_Gate_F_Event_Complete_Component_Risk_Analysis.md)
+- [OHR-MSHNet AAAI-27 candidate design](MSHNet_OHR_AAAI27_Model_Design.md)
 - [Decision conversion and evidence utilization](MSHNet_Decision_Conversion_Gate_and_Evidence_Utilization_Plan.md)
 - [CCSR formal audit](MSHNet_CCSR_Formal_Audit_and_Corrected_Spec.md)
 - [CCSR novelty and modification plan](MSHNet_CCSR_Novelty_and_Code_Modification_Plan.md)
@@ -74,6 +78,7 @@ must always be named separately.
 |-- utils/
 |   |-- metric.py                   # legacy and audit component metrics
 |   |-- component_ledger.py
+|   |-- component_frontier_decomposition.py
 |   |-- component_operating_point.py
 |   |-- cross_seed_persistence.py
 |   |-- feature_survival.py
@@ -174,7 +179,7 @@ python -m pytest -q
 Focused suites cover baseline purity, checkpoint compatibility, component
 matching, target identity, CCSR references, feature survival, decision
 conversion, low-FA cross-fitting, nested-grid sensitivity, risk-control
-feasibility, and cross-seed persistence.
+feasibility, component-frontier decomposition, and cross-seed persistence.
 
 ## Experimental Boundaries
 
@@ -183,6 +188,9 @@ feasibility, and cross-seed persistence.
 - OMM, CCSR, operating-point MIL, and constrained edit implementations are
   reference or negative-control code unless a governing gate explicitly
   authorizes training.
+- OHR is currently a design specification with explicit correctness,
+  overfitting, frozen-feature, and paired-short-run gates. Mathematical OR
+  consistency is not evidence of improved IoU, Pd, or FA.
 - Do not report audit-Hungarian values as official legacy metrics.
 - Do not treat oracle threshold sweeps as deployable cross-fitted performance.
 - Official test sets remain sealed until the method and evaluation protocol
