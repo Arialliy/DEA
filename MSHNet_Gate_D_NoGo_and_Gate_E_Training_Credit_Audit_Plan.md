@@ -1,6 +1,6 @@
 # MSHNet Gate D 冻结结论与 Gate E v2.2 可执行审计方案
 
-> 状态：**Gate E v2.2，2026-07-12。E−1a 与 E−1b PASS，E−1c FAIL，因此训练信用路线的 Gate E0 NO-GO。v2.2 的运行前协议哈希保存在 E−1b/E−1c provenance；本文后续结果段是运行后的审计记录。**
+> 状态：**Gate E v2.2，2026-07-12。E−1a 与 E−1b PASS，E−1c FAIL，因此训练信用路线的 Gate E0 NO-GO。后续 Gate F v1 只读分解已完成，但没有授权新方法或训练。v2.2 的运行前协议哈希保存在 E−1b/E−1c provenance；本文后续结果段是运行后的审计记录。**
 >
 > 上位约束见 [MSHNet_North_Star_Objective_and_Gate_E_Positioning.md](./MSHNet_North_Star_Objective_and_Gate_E_Positioning.md)。
 >
@@ -1146,12 +1146,27 @@ E−1c 还必须测试：held-out logits 不进入 threshold grid；deterministi
 9. 跑 E−1c 双 matcher low-FA bridge（FAIL）；
 10. 按前瞻规则关闭 E0，不起草 amendment，不训练。
 
-下一步不是继续修改 Gate E，而是返回 North Star 做方向重置。当前唯一新证据是 **component operating threshold 的 calibration-to-held-out transport 不稳定**；它尚不是创新，也不能直接包装成 calibration loss。允许的新阶段只能是只读 Gate F：
+下一步不是继续修改 Gate E，而是返回 North Star 做方向重置。Gate F v1 已完成只读分解，独立 bundle 为：
 
-1. 把 E−1c 超调分解为 score-tail shift、component-count/area concentration、fold threshold migration 与 dataset/seed dependence；
-2. 检索 risk-control、conformal calibration、low-FPR detection 与 component-level operating-point training 的直接先例；
-3. 只有在找到现有方法不能覆盖的机制缺口，并能提出单一原理而非模块堆叠时，才冻结新的方法 Gate；
-4. Gate F 之前不启动新的 long-run 训练。
+```text
+$HOME/DEA/repro_runs/gate_f/operating_transport_v1
+```
+
+它复核了 36 个 calibration records、8064 个 image rows、144 个 fold transport rows 与 72 个 pooled rows，并保持 E−1c FAIL 不变。主要结果是：
+
+1. matcher 折叠后，nominal budget 1/5/10/20 的正式池化失败分别为 7/6/6/2 个 dataset-seeds；
+2. α=20 的两个失败都能被 outcome-visible top-1 image sensitivity 翻转，但 α=1/10 的大多数失败不能，因此统一 hard-image tail hypothesis 不成立；
+3. 36/36 matcher-specific calibration curves 的 unmatched component area 随阈值存在局部非单调，最大单步回升 93 pixels；
+4. 该实验只是同数据集内 calibration-to-held-out generalization，不是 cross-domain transport；
+5. LTT、CRC、non-monotonic CRC、matching-aware SeqCRC、partial-AUC 与 IRSTD evaluation 先例使“普通 calibration/risk-control 应用”直接 NO-GO。
+
+完整 prior-art 路由和数值见 `MSHNet_North_Star_Objective_and_Gate_E_Positioning.md` 的 12.1–12.3。下一步只允许无训练 Gate F0：
+
+1. 生成固定 checkpoint 的逐图、全阈值 outcome cache；
+2. 先实现并比较 empirical selector、LTT 与适用的 CRC/non-monotonic risk-control 强 baseline；
+3. 如果通用方法已给出非 all-off 预算控制，structure-aware 方法路线立即 NO-GO；
+4. 只有证明通用方法的保守性来自 component topology/matching，而不是普通样本不足时，才冻结 theorem/solver Gate；
+5. Gate F0 不修改网络、loss 或 optimizer，不启动训练，official test 继续封存。
 
 本轮不做：
 
