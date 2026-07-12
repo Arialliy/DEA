@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from scipy.ndimage import distance_transform_edt
 
-from utils.metric import match_components_hungarian
+from utils.metric import match_components_hungarian, match_connected_components
 
 
 DEFAULT_TAIL_QUANTILES = tuple(
@@ -213,6 +213,7 @@ def evaluate_component_operating_points(
     target_samples: Iterable[object],
     thresholds: Iterable[float],
     *,
+    matching: str = "hungarian",
     centroid_radius: float = 3.0,
     connectivity: int = 2,
 ) -> tuple[ComponentOperatingPoint, ...]:
@@ -223,6 +224,8 @@ def evaluate_component_operating_points(
     ``sum(unmatched prediction area) / sum(image pixels) * 1e6``.
     """
 
+    if matching not in {"legacy", "hungarian"}:
+        raise ValueError("matching must be 'legacy' or 'hungarian'")
     samples = _validate_samples(logit_samples, target_samples)
     threshold_grid = _thresholds(thresholds, name="thresholds")
     total_pixels = sum(int(scores.size) for scores, _ in samples)
@@ -235,12 +238,20 @@ def evaluate_component_operating_points(
         unmatched_prediction_components = 0
         unmatched_prediction_area = 0
         for scores, target in samples:
-            component_match = match_components_hungarian(
-                scores > threshold,
-                target,
-                centroid_radius=centroid_radius,
-                connectivity=connectivity,
-            )
+            if matching == "legacy":
+                component_match = match_connected_components(
+                    scores > threshold,
+                    target,
+                    max_centroid_distance=centroid_radius,
+                    connectivity=connectivity,
+                )
+            else:
+                component_match = match_components_hungarian(
+                    scores > threshold,
+                    target,
+                    centroid_radius=centroid_radius,
+                    connectivity=connectivity,
+                )
             matched_components += len(component_match.matches)
             target_components += len(component_match.target_regions)
             prediction_components += len(component_match.prediction_regions)
@@ -351,6 +362,7 @@ def calibrate_component_operating_points(
     target_samples: Iterable[object],
     fa_budgets_per_million_pixels: Iterable[float],
     *,
+    matching: str = "hungarian",
     fixed_thresholds: Sequence[float] = (0.0,),
     tail_quantiles: Sequence[float] = DEFAULT_TAIL_QUANTILES,
     centroid_radius: float = 3.0,
@@ -371,6 +383,7 @@ def calibrate_component_operating_points(
         logits,
         targets,
         threshold_grid,
+        matching=matching,
         centroid_radius=centroid_radius,
         connectivity=connectivity,
     )
@@ -391,6 +404,7 @@ def evaluate_target_operating_status(
     *,
     target_index: int,
     threshold: float,
+    matching: str = "hungarian",
     centroid_radius: float = 3.0,
     neighborhood_radius: float = 3.0,
     connectivity: int = 2,
@@ -409,12 +423,22 @@ def evaluate_target_operating_status(
         raise ValueError("target_index must be an integer")
     target_index = int(target_index)
 
-    component_match = match_components_hungarian(
-        scores > threshold_value,
-        target_array,
-        centroid_radius=centroid_radius,
-        connectivity=connectivity,
-    )
+    if matching not in {"legacy", "hungarian"}:
+        raise ValueError("matching must be 'legacy' or 'hungarian'")
+    if matching == "legacy":
+        component_match = match_connected_components(
+            scores > threshold_value,
+            target_array,
+            max_centroid_distance=centroid_radius,
+            connectivity=connectivity,
+        )
+    else:
+        component_match = match_components_hungarian(
+            scores > threshold_value,
+            target_array,
+            centroid_radius=centroid_radius,
+            connectivity=connectivity,
+        )
     if target_index < 0 or target_index >= len(component_match.target_regions):
         raise ValueError(
             f"target_index must be in [0, {len(component_match.target_regions)})"

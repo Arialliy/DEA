@@ -58,6 +58,30 @@ def test_operating_curve_uses_hungarian_maximum_cardinality() -> None:
     assert point.pd == 1.0
     assert point.unmatched_prediction_area == 0
 
+    legacy = evaluate_component_operating_points(
+        [logits], [target], [0.0], matching="legacy"
+    )[0]
+    assert legacy.matched_components == 1
+    assert legacy.unmatched_prediction_area == 2
+
+
+def test_operating_point_matching_argument_fails_closed() -> None:
+    logits = np.zeros((2, 2))
+    target = np.zeros((2, 2), dtype=np.uint8)
+    with pytest.raises(ValueError, match="matching"):
+        evaluate_component_operating_points(
+            [logits], [target], [0.0], matching="unknown"
+        )
+    target[0, 0] = 1
+    with pytest.raises(ValueError, match="matching"):
+        evaluate_target_operating_status(
+            logits,
+            target,
+            target_index=0,
+            threshold=0.0,
+            matching="unknown",
+        )
+
 
 def test_threshold_grid_is_deterministic_unique_and_includes_all_off() -> None:
     logits = [
