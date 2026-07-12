@@ -65,6 +65,33 @@ def test_operating_curve_uses_hungarian_maximum_cardinality() -> None:
     assert legacy.unmatched_prediction_area == 2
 
 
+@pytest.mark.parametrize("matching", ["hungarian", "legacy"])
+def test_matching_defined_false_area_can_increase_as_threshold_rises(
+    matching: str,
+) -> None:
+    logits = np.full((7, 9), -1.0)
+    target = np.zeros((7, 9), dtype=np.uint8)
+    target[3, 2] = 1
+    # At tau=0 the bridge joins both peaks into one component whose centroid
+    # is two pixels from the target, so the whole component is matched.  At
+    # tau=1.5 the bridge disappears: the target peak remains matched while the
+    # remote peak becomes an unmatched component.  This is a topology/matching
+    # effect, even though every superlevel mask only shrinks with threshold.
+    logits[3, 2] = 2.0
+    logits[3, 3:6] = 1.0
+    logits[3, 6] = 2.0
+
+    curve = evaluate_component_operating_points(
+        [logits],
+        [target],
+        [0.0, 1.5, 2.0],
+        matching=matching,
+    )
+
+    assert [point.unmatched_prediction_area for point in curve] == [0, 1, 0]
+    assert [point.matched_components for point in curve] == [1, 1, 0]
+
+
 def test_operating_point_matching_argument_fails_closed() -> None:
     logits = np.zeros((2, 2))
     target = np.zeros((2, 2), dtype=np.uint8)

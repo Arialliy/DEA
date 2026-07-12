@@ -1,6 +1,6 @@
 # MSHNet 项目的固定目标、当前验证任务与未来方法边界（审计修订版）
 
-> 文档状态：**North Star v2，2026-07-12 冻结评测口径；Gate F v1 只读诊断已完成，方法仍未授权。**
+> 文档状态：**North Star v2，2026-07-12 冻结评测口径；Gate F v1 与 Gate F0 理论预门已完成，operating-point risk-control 路线 NO-GO，方法仍未授权。**
 >
 > 这是一份项目宪法和证据门说明，不是论文创新声明，也不是可直接反向传播的训练目标。后续任何 surrogate、诊断量或优化器改动都必须回到这里定义的外部终点接受检验。
 
@@ -788,7 +788,7 @@ w_\alpha
 
 ## 当前阶段任务
 
-> **固定 epoch baseline 的 exact component miss 存在跨 seed 支撑，但它没有通过双 matcher、零超调的低-FA桥接；因此不再执行训练信用 E0。Gate F v1 已证明当前现象既不是单一 hard-image 机制，也不足以形成通用 calibration 创新。下一步只能先用强 risk-control baseline 证伪剩余的 topology-and-matching 特有问题，不能直接设计新 loss。**
+> **固定 epoch baseline 的 exact component miss 存在跨 seed 支撑，但它没有通过双 matcher、零超调的低-FA桥接；因此不再执行训练信用 E0。Gate F v1 已否定单一 hard-image 解释，Gate F0 又证明 generic distribution-free risk control 在当前 rare-event 风险尺度和样本量下必然 vacuous。operating-point 路线已关闭；下一步回到 Gate G 重新搜索表示级单一机制，仍不能直接设计新 loss。**
 
 当前执行顺序应为：
 
@@ -804,9 +804,9 @@ w_\alpha
 \longrightarrow
 \text{Gate F v1：只读分解与 prior art（完成）}
 \longrightarrow
-\text{Gate F0：通用 risk-control falsification}
+\text{Gate F0：通用 risk-control 理论预门（NO-GO）}
 \longrightarrow
-\text{条件性方法设计}
+\text{Gate G：重新搜索表示级单一机制}
 }
 \]
 
@@ -867,6 +867,7 @@ $HOME/DEA/repro_runs/gate_f/operating_transport_v1
 | [Conformal prediction with limited false positives](https://proceedings.mlr.press/v162/fisch22a.html) | 直接研究 false-positive 数量控制 | “控制虚警”本身不构成 gap |
 | [SeqCRC for object detection](https://arxiv.org/abs/2505.24038) | 已把 matching、空图像与置信阈值纳入检测风险控制 | matching-aware calibration 不能单独声称新颖 |
 | [Conformal Risk Control with Non-Monotonic Loss Functions](https://arxiv.org/abs/2602.20151) | 直接处理非单调、多维风险控制 | “component FA 非单调”本身仍不是算法贡献 |
+| [CRC under Non-Monotone Losses](https://arxiv.org/abs/2604.01502) | 已给出有限网格、bounded non-monotone loss 的有限样本修正、minimax lower bound、object-detection 实验与 shift 扩展 | generic finite-grid non-monotone CRC 已无主创新空间 |
 | [Rethinking Evaluation Metrics of IRSTD](https://papers.nips.cc/paper_files/paper/2025/hash/a81051ae2c8b1e46bd51480917b8ab84-Abstract-Datasets_and_Benchmarks_Track.html) | 已研究 IRSTD matching、错误类型和跨数据集评价；阈值设计被留在其范围外 | 仍有 operating-point 研究空间，但单做评价 taxonomy 高度拥挤 |
 | [Deep partial AUC optimization](https://proceedings.neurips.cc/paper_files/paper/2022/hash/ca7998666c2e53cc1e882b7268414d8a-Abstract-Conference.html) | 已直接优化低 FPR 区间的排序 | 普通 pAUC、DRO 或 rank consistency 不是新原理 |
 | [SLS/MSHNet](https://openaccess.thecvf.com/content/CVPR2024/html/Liu_Infrared_Small_Target_Detection_with_Scale_and_Location_Sensitivity_CVPR_2024_paper.html)、[REEM](https://openaccess.thecvf.com/content/CVPR2026W/PBVS/html/Sevim_SCR-Guided_Difficulty-Aware_Optimization_for_Infrared_Small_Target_Detection_CVPRW_2026_paper.html) | scale/location sensitivity 与 SCR difficulty weighting 已直接用于 MSHNet | 不能回到面积、对比度、难度加权或训练 loss 堆叠 |
@@ -884,16 +885,88 @@ $HOME/DEA/repro_runs/gate_f/operating_transport_v1
 
 这只是待证伪的问题，不是方法声明。它必须同时提供新的结构刻画、理论界或 solver；如果只是 threshold grid、置信上界、pAUC、GroupDRO、rank consistency、CFAR 或已有 risk-control 的领域替换，则立即 NO-GO。
 
-## 12.3 下一门：Gate F0 generic risk-control falsification
+## 12.3 Gate F0：generic risk-control 理论可行性预门
 
-方法设计前只允许再做一个无训练 gate：
+在重跑模型或生成逐图全候选 outcome cache 前，先检查一个更强的必要条件。当前所有图像固定为 (256\times256)，故对每图定义
 
-1. 在 fixed-epoch development holdout 上生成逐图、全阈值的 component outcome cache；同一 logits 只做一次推理，两种 matcher 独立计算，official test 继续封存；
-2. 先实现 current empirical selector、LTT 与适用的 CRC/non-monotonic risk-control 强 baseline，明确区分各自控制的是期望风险、高概率风险还是经验风险；
-3. 所有方法必须报告 achieved FA、Pd、all-off rate、置信水平、校准样本量和阈值稳定性，禁止只报 nominal budget；
-4. 如果通用方法已在至少两个 datasets、三个 seeds、两个 matchers 上给出非 all-off 的预算控制，则结构化新方法路线 NO-GO；
-5. 只有当通用方法稳定地 vacuous/过度保守，并能证明原因来自 component topology/matching 而不是样本量不足时，才允许冻结 structure-aware theorem/solver Gate；
-6. Gate F0 前后都不修改 MSHNet forward、loss、optimizer，也不启动训练。
+\[
+\ell_\tau(X,Y)
+=
+\frac{A_{\mathrm{unmatched}}(X,Y;\tau)}{65536}
+\in[0,1],
+\qquad
+\alpha_b=\frac{b}{10^6}.
+\]
+
+此时 (E[\ell_\tau]) 与 pooled FA/Mpix 的 population analogue 对齐。若以后图像尺寸不同，(E[A/P]) 不再等于 (\sum A/\sum P)，本推导不能静默沿用。
+
+解析审计工具与 immutable 输出为：
+
+```text
+$HOME/DEA/tools/audit_gate_f0_risk_control_feasibility.py
+$HOME/DEA/repro_runs/gate_f/risk_control_feasibility_v1
+```
+
+### HB-LTT 的最佳情形仍不可认证
+
+对 bounded loss 的假设 (H_0:R(\tau)>\alpha)，即使 calibration 上观测到 **零经验 loss**，Hoeffding--Bentkus LTT 的最小 p-value 仍为
+
+\[
+p_{\min}=(1-\alpha)^n.
+\]
+
+冻结 confidence sensitivities 为 δ∈{0.10,0.05,0.01}。下表给出最宽松的 δ=0.10；single candidate 相当于预设 fixed sequence 的最佳情况，54-way Bonferroni 对应一个 matcher 的冻结候选网格。若要求两个 matcher 同时控制，108-way correction 只会更严格。
+
+| FA/Mpix | 最大 cross-fit calibration n | 全 development n 上界 | 零 loss 单候选所需 n | 54-way Bonferroni 所需 n |
+|---:|---:|---:|---:|---:|
+| 1 | 82 | 160 | 2,302,584 | 6,291,566 |
+| 5 | 82 | 160 | 460,516 | 1,258,311 |
+| 10 | 82 | 160 | 230,258 | 629,154 |
+| 20 | 82 | 160 | 115,129 | 314,576 |
+
+这不是 HB inequality 的偶然松弛。考虑风险为 (\mathrm{Bernoulli}(\alpha+\epsilon)) 的不合格候选，它仍以 ((1-\alpha-\epsilon)^n) 的概率产生全零 calibration 样本。只要该概率大于 δ，任何声称 distribution-free (1-δ) 有效的 generic certifier 都不能在该全零事件上认证；令 ε→0 即恢复同一信息下界。换 empirical Bernstein、e-value 或另一条 concentration inequality 不能从当前样本量中创造缺失的 rare-event 信息。
+
+### 标准 CRC 的 correction floor 也不可行
+
+原始 component false-area loss 非单调，因此标准 CRC 不能直接应用。即便先取逐图 monotone majorant，并把它当作最有利的必要条件，unit loss bound (B=1) 仍要求
+
+\[
+\frac{n}{n+1}\widehat R(\tau)
++
+\frac{1}{n+1}
+\le
+\alpha.
+\]
+
+在 (\widehat R=0) 时，四个预算所需的最小 (n) 分别为 999,999、199,999、99,999 和 49,999，仍远大于当前数据。
+
+若想降低 correction floor，必须在预测前给出确定性 loss upper bound (B<1)。在最有利的 (n=82) 下，对 FA=1/5/10/20，等价的**总预测面积**上限至多为 5/27/54/108 pixels，才能保证 unmatched area 也不超过该 bound。冻结 baseline 没有这种机制；直接限制 unmatched area 需要测试 GT，限制总预测面积则改变推理决策且极可能损害 Pd，并违反当前 inference-graph invariance 路线。
+
+唯一无条件安全的候选是预先规定 (\tau=+\infty) 的 no-prediction rule；它满足 FA=0，但 Pd=0，已被 all-off veto 排除。calibration maximum logit 只在 calibration images 上 all-off，不是对未来图像的确定性保证。
+
+因此：
+
+\[
+\boxed{
+\text{Gate F0 generic distribution-free risk control：NO-GO}
+}
+\]
+
+该结论的原因是 **rare-event sample size**，不是已经证明的 component-topology 优势。它同时否定了此前的开放条件“generic 方法 vacuous 且原因来自 topology/matching”：当前保守性无需 topology 就能完全解释。因此不开放 structure-aware theorem/solver Gate，也不为 LTT/CRC 重跑约 265 MiB 的 outcome cache。真实 outcome 不可能优于本预门已经假设的零经验 loss。
+
+这个预门不否定带有额外、可验证结构假设的方法，也不评估 held-out oracle Pd 或 exact frontier；但任何新假设都必须明确说明新增了什么可识别信息，不能把 information-theoretic sample shortage 改名为 topology innovation。
+
+## 12.4 Gate G：重新搜索表示级单一机制
+
+Gate F 关闭后，不再继续修改 threshold selector、matching solver、CRC、置信上界或 calibration loss。下一方向必须同时满足：
+
+1. 机制直接作用于 score field 的 target/background ordering 或 component formation，而不是在结果后调阈值；
+2. 在实现方法前，先证明该机制在至少两个 datasets、三个 seeds 和两个 matcher 的实际 operating neighborhood 中稳定存在；
+3. 不等价于已有 topology/persistent-homology loss、area/SCR weighting、hard-negative focal、pAUC/GroupDRO 或模块堆叠；
+4. 训练后仍使用原 MSHNet inference graph；
+5. 外部终点仍是 cross-fitted achieved `Pd@FA≤α` 与 mask-quality non-regression。
+
+Gate G 当前只是方向检索状态。不得因为“component risk 非单调”就直接设计 topology loss；Gate F 已证明非单调事实存在，但没有证明它导致 calibration-to-held-out overshoot。
 
 当前状态：
 
@@ -901,7 +974,7 @@ $HOME/DEA/repro_runs/gate_f/operating_transport_v1
 \boxed{
 \text{Gate F v1 diagnosis PASS}
 \;\land\;
-\text{generic calibration novelty NO-GO}
+\text{Gate F0 risk-control feasibility NO-GO}
 \;\land\;
 \text{method authorization = NO}
 }

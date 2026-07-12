@@ -27,12 +27,21 @@ Current evidence gates are conservative:
   currently **NO-GO**.
 - Gate F v1 completed a read-only operating-transport decomposition. It does
   not authorize a new loss, architecture, solver, or long training run.
+- Gate F0 then showed analytically that best-case HB-LTT and unit-bound CRC
+  are sample-size-vacuous at the frozen `1--20 FA/Mpix` risks; the generic
+  operating-point risk-control route is therefore **NO-GO**.
+- Gate F nested Q0/Q1/Q2 grids are alternative-grid sensitivity checks only.
+  Exact unique-logit sweeps are conditional diagnostics and cannot reopen the
+  frozen E-1c decision or authorize training.
+- Gate G is direction search only. No representation-level method has been
+  authorized.
 
 These are project-routing results, not paper novelty or performance claims.
 The governing definitions and latest status are documented in:
 
 - [North Star objective and Gate E positioning](MSHNet_North_Star_Objective_and_Gate_E_Positioning.md)
 - [Gate D/E audit plan and Gate F record](MSHNet_Gate_D_NoGo_and_Gate_E_Training_Credit_Audit_Plan.md)
+- [Gate F event-complete component-risk analysis](MSHNet_Gate_F_Event_Complete_Component_Risk_Analysis.md)
 - [Decision conversion and evidence utilization](MSHNet_Decision_Conversion_Gate_and_Evidence_Utilization_Plan.md)
 - [CCSR formal audit](MSHNet_CCSR_Formal_Audit_and_Corrected_Spec.md)
 - [CCSR novelty and modification plan](MSHNet_CCSR_Novelty_and_Code_Modification_Plan.md)
@@ -68,6 +77,8 @@ must always be named separately.
 |   |-- component_operating_point.py
 |   |-- cross_seed_persistence.py
 |   |-- feature_survival.py
+|   |-- nested_component_grid.py
+|   |-- risk_control_feasibility.py
 |   `-- target_identity.py
 |-- tools/                           # reproducible audit/finalization CLIs
 |-- tests/                           # unit and protocol regression tests
@@ -162,7 +173,8 @@ python -m pytest -q
 
 Focused suites cover baseline purity, checkpoint compatibility, component
 matching, target identity, CCSR references, feature survival, decision
-conversion, low-FA cross-fitting, and cross-seed persistence.
+conversion, low-FA cross-fitting, nested-grid sensitivity, risk-control
+feasibility, and cross-seed persistence.
 
 ## Experimental Boundaries
 

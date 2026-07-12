@@ -1,6 +1,6 @@
 # MSHNet Gate D 冻结结论与 Gate E v2.2 可执行审计方案
 
-> 状态：**Gate E v2.2，2026-07-12。E−1a 与 E−1b PASS，E−1c FAIL，因此训练信用路线的 Gate E0 NO-GO。后续 Gate F v1 只读分解已完成，但没有授权新方法或训练。v2.2 的运行前协议哈希保存在 E−1b/E−1c provenance；本文后续结果段是运行后的审计记录。**
+> 状态：**Gate E v2.2，2026-07-12。E−1a 与 E−1b PASS，E−1c FAIL，因此训练信用路线的 Gate E0 NO-GO。后续 Gate F v1 与 Gate F0 理论预门均已完成，operating-point risk-control 路线 NO-GO，仍未授权新方法或训练。v2.2 的运行前协议哈希保存在 E−1b/E−1c provenance；本文后续结果段是运行后的审计记录。**
 >
 > 上位约束见 [MSHNet_North_Star_Objective_and_Gate_E_Positioning.md](./MSHNet_North_Star_Objective_and_Gate_E_Positioning.md)。
 >
@@ -1160,13 +1160,25 @@ $HOME/DEA/repro_runs/gate_f/operating_transport_v1
 4. 该实验只是同数据集内 calibration-to-held-out generalization，不是 cross-domain transport；
 5. LTT、CRC、non-monotonic CRC、matching-aware SeqCRC、partial-AUC 与 IRSTD evaluation 先例使“普通 calibration/risk-control 应用”直接 NO-GO。
 
-完整 prior-art 路由和数值见 `MSHNet_North_Star_Objective_and_Gate_E_Positioning.md` 的 12.1–12.3。下一步只允许无训练 Gate F0：
+Gate F0 随后先执行零推理的 sample-size 必要条件，而没有直接构建 outcome cache。输出为：
 
-1. 生成固定 checkpoint 的逐图、全阈值 outcome cache；
-2. 先实现并比较 empirical selector、LTT 与适用的 CRC/non-monotonic risk-control 强 baseline；
-3. 如果通用方法已给出非 all-off 预算控制，structure-aware 方法路线立即 NO-GO；
-4. 只有证明通用方法的保守性来自 component topology/matching，而不是普通样本不足时，才冻结 theorem/solver Gate；
-5. Gate F0 不修改网络、loss 或 optimizer，不启动训练，official test 继续封存。
+```text
+$HOME/DEA/repro_runs/gate_f/risk_control_feasibility_v1
+```
+
+对每图 bounded loss (\ell=A_{\rm unmatched}/65536\) 与风险目标 (\alpha=b/10^6)，即使经验 loss 为 0，HB-LTT 的最佳 p-value 仍为 ((1-\alpha)^n)。在最宽松的 δ=0.1 下，FA=1/5/10/20 的单候选最小样本数为 2,302,584 / 460,516 / 230,258 / 115,129；54-way Bonferroni 为 6,291,566 / 1,258,311 / 629,154 / 314,576。当前 cross-fit calibration 最多 82 images，全 development 也最多 160。
+
+标准 CRC 的 unit-bound correction floor (1/(n+1)) 在四个预算下分别需要至少 999,999 / 199,999 / 99,999 / 49,999 images。Bernoulli ((\alpha+\epsilon)) 的全零观测反例说明该缺口不是换 concentration inequality 即可消除。唯一无条件安全输出是 Pd=0 的 (\tau=+\infty) all-off，已被 veto。
+
+因此：
+
+\[
+\boxed{\text{Gate F0 generic risk control NO-GO}}
+\]
+
+真实 outcome 不可能优于“零经验 loss”这一解析最佳情形，故不为 LTT/CRC 重跑约 265 MiB 的逐图候选缓存。generic 方法的 vacuity 已由 rare-event sample size 完全解释，不能归因给 topology/matching，也不开放 structure-aware theorem/solver Gate。完整推导、2604.01502 的直接新颖性压力与 Gate G 路由见 North Star 12.2–12.4。
+
+下一步返回 Gate G 做表示级方向检索；仍不修改网络、loss、optimizer，不启动训练，official test 继续封存。
 
 本轮不做：
 
