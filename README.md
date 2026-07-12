@@ -33,11 +33,15 @@ Current evidence gates are conservative:
 - Gate F nested Q0/Q1/Q2 grids are alternative-grid sensitivity checks only.
   Gate F-1a finished **NO-GO**, so targeted/full unique-logit sweeps remain
   unauthorized and cannot reopen the frozen E-1c decision.
-- Gate G0 adds a read-only component-frontier decomposition for separating
-  selection sensitivity, peak ordering, and component conversion limits.
-- OHR-MSHNet is the current frozen candidate design for an OR-consistent
-  multi-scale prediction head. It has no reported Gate 0--3 or performance
-  result yet and must not be described as a validated method.
+- Gate G0 finite-frontier v2 completed its read-only decomposition. Both the
+  component-conversion direction and comparable joint-oracle gain failed the
+  preregistered cross-dataset coverage gates.
+- OHR-MSHNet is **RETRACTED / FINAL NO-GO**. Its occupancy-probability premise
+  is not justified by SLS side outputs or the actual MSHNet inference graph,
+  and existing fusion evidence does not support the proposed replacement.
+- The repository currently has no authorized top-tier model method or long
+  training route. Predictive correction remains conditional research only and
+  would require a separate architecture-level North Star and new evidence gate.
 
 These are project-routing results, not paper novelty or performance claims.
 The governing definitions and latest status are documented in:
@@ -45,7 +49,8 @@ The governing definitions and latest status are documented in:
 - [North Star objective and Gate E positioning](MSHNet_North_Star_Objective_and_Gate_E_Positioning.md)
 - [Gate D/E audit plan and Gate F record](MSHNet_Gate_D_NoGo_and_Gate_E_Training_Credit_Audit_Plan.md)
 - [Gate F event-complete component-risk analysis](MSHNet_Gate_F_Event_Complete_Component_Risk_Analysis.md)
-- [OHR-MSHNet AAAI-27 candidate design](MSHNet_OHR_AAAI27_Model_Design.md)
+- [Retracted OHR-MSHNet AAAI-27 design record](MSHNet_OHR_AAAI27_Model_Design.md)
+- [Updated repository audit and AAAI route decision](DEA_Updated_Repo_Audit_and_AAAI_Model_Routing_2026-07-12.md)
 - [Decision conversion and evidence utilization](MSHNet_Decision_Conversion_Gate_and_Evidence_Utilization_Plan.md)
 - [CCSR formal audit](MSHNet_CCSR_Formal_Audit_and_Corrected_Spec.md)
 - [CCSR novelty and modification plan](MSHNet_CCSR_Novelty_and_Code_Modification_Plan.md)
@@ -188,9 +193,8 @@ feasibility, component-frontier decomposition, and cross-seed persistence.
 - OMM, CCSR, operating-point MIL, and constrained edit implementations are
   reference or negative-control code unless a governing gate explicitly
   authorizes training.
-- OHR is currently a design specification with explicit correctness,
-  overfitting, frozen-feature, and paired-short-run gates. Mathematical OR
-  consistency is not evidence of improved IoU, Pd, or FA.
+- OHR is retained only as a retracted design record. Do not implement, train,
+  report, or include it in an ablation table as the current project method.
 - Do not report audit-Hungarian values as official legacy metrics.
 - Do not treat oracle threshold sweeps as deployable cross-fitted performance.
 - Official test sets remain sealed until the method and evaluation protocol

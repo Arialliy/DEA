@@ -1,6 +1,11 @@
 # OHR-MSHNet：面向 AAAI-27 的 MSHNet 单点结构改进方案
 
-> **文档状态：主方案冻结版 v1.0**  
+> **STATUS: RETRACTED / FINAL NO-GO（2026-07-12）**
+> **原因：side SLS 输出不具备已识别的 block-occupancy 概率语义；noisy-OR
+> 假设与实际 MSHNet 推理图不一致；Gate D/G0 证据不支持 final-fusion 或
+> component-conversion 作为统一根因。本文仅作为历史设计记录保留，不实现、
+> 不训练、不进入消融表。**
+> **原文状态：主方案冻结版 v1.0（已撤回）**
 > **Baseline：MSHNet（CVPR 2024）**  
 > **主模型：OHR-MSHNet（OR-Consistent Hazard Routing MSHNet）**  
 > **论文暂定题目：From Coarse Occupancy to Pixel Evidence: OR-Consistent Hazard Routing for Infrared Small Target Detection**  
