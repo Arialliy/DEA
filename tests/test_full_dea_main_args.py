@@ -14,6 +14,7 @@ if ROOT not in sys.path:
 
 from main import (
     Trainer,
+    crwd_enabled,
     dea_lite_enabled,
     get_method_metadata,
     get_method_name,
@@ -76,6 +77,20 @@ def make_args(**kwargs):
         predictive_delta_min=0.05,
         predictive_legacy_numerics=False,
         predictive_log_interval=50,
+        crwd_lambda=0.0,
+        crwd_ramp_epochs=20,
+        crwd_protect_kernel=7,
+        crwd_target_temperature=0.25,
+        crwd_tail_temperature=0.25,
+        crwd_delta_target=0.05,
+        crwd_delta_margin=0.05,
+        crwd_tail_tolerance=0.05,
+        crwd_margin_floor=0.0,
+        crwd_max_margin_credit=1.0,
+        crwd_confidence_width=0.25,
+        crwd_huber_delta=0.25,
+        crwd_log_interval=50,
+        multi_gpus=False,
         dataset_dir="datasets/NUAA-SIRST",
         seed=20260706,
         deterministic=True,
@@ -89,6 +104,46 @@ def test_full_dea_rejects_dea_lite_lambdas() -> None:
     args = make_args(model_type="full_dea", dea_lambda_single=0.01)
     with pytest.raises(ValueError):
         validate_args(args)
+
+
+def test_crwd_args_metadata_and_checkpoint_semantics_are_fail_closed() -> None:
+    args = validate_args(make_args(crwd_lambda=0.2, crwd_ramp_epochs=12))
+    assert crwd_enabled(args)
+    assert is_noncanonical_plain_mshnet_experiment(args)
+    assert get_method_name(args) == "CRWD-MSHNet-S16"
+    metadata = get_method_metadata(args)
+    assert metadata["crwd_enabled"] is True
+    assert metadata["crwd_lambda"] == 0.2
+    assert metadata["crwd_ramp_epochs"] == 12
+    assert metadata["crwd_stride"] == 16
+    assert metadata["crwd_directions"] == [[0, 1], [1, 0], [1, 1]]
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer, {"method_meta": metadata}, check_split_hashes=False
+    )
+    mismatched = dict(metadata)
+    mismatched["crwd_delta_margin"] = 0.2
+    with pytest.raises(RuntimeError, match="crwd_delta_margin"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": mismatched}, check_split_hashes=False
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"crwd_lambda": -0.1},
+        {"crwd_lambda": 0.1, "model_type": "full_dea"},
+        {"crwd_lambda": 0.1, "mshnet_objective": "omm2d_identity"},
+        {"crwd_lambda": 0.1, "multi_gpus": True},
+        {"crwd_lambda": 0.1, "crwd_protect_kernel": 4},
+    ],
+)
+def test_crwd_invalid_combinations_are_rejected(overrides) -> None:
+    with pytest.raises(ValueError):
+        validate_args(make_args(**overrides))
 
 
 def test_dea_lite_is_explicit_and_checkpoint_semantics_are_fail_closed() -> None:

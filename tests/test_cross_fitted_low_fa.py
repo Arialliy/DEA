@@ -72,6 +72,7 @@ def test_cross_fit_grid_uses_only_calibration_logits_and_keeps_target_free_image
         seed=1,
         registry=registry,
         checkpoint={"policy": "fixed_epoch", "epoch": 399},
+        tail_quantiles=(0.5, 1.0),
     )
 
     eval_fold0 = [
@@ -81,6 +82,7 @@ def test_cross_fit_grid_uses_only_calibration_logits_and_keeps_target_free_image
     ][0]
     assert max(eval_fold0["threshold_grid"]) == 2.0
     assert 100.0 not in eval_fold0["threshold_grid"]
+    assert eval_fold0["tail_quantiles"] == [0.5, 1.0]
     assert len(target_rows) == 2 * len(MATCHERS) * len(BUDGETS)
     assert len(image_rows) == 2 * len(MATCHERS) * len(BUDGETS)
     assert all(row["held_out_fold_aggregate"]["total_pixels"] == 64 for row in image_rows)

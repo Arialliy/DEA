@@ -152,6 +152,7 @@ def cross_fit_job(
     seed: int,
     registry: Mapping[str, StableTargetSet],
     checkpoint: Mapping[str, Any],
+    tail_quantiles: Sequence[float] = DEFAULT_TAIL_QUANTILES,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Cross-fit both matchers for one frozen dataset/seed checkpoint."""
 
@@ -184,10 +185,11 @@ def cross_fit_job(
         ]
         calibration_logits = [score_arrays[index] for index in calibration_indices]
         calibration_targets = [target_arrays[index] for index in calibration_indices]
+        quantiles = tuple(float(value) for value in tail_quantiles)
         threshold_grid = build_logit_threshold_grid(
             calibration_logits,
             fixed_thresholds=(0.0,),
-            tail_quantiles=DEFAULT_TAIL_QUANTILES,
+            tail_quantiles=quantiles,
         )
         if max(float(np.max(value)) for value in calibration_logits) not in threshold_grid:
             raise LowFABridgeError("calibration grid lacks its all-off candidate")
@@ -218,7 +220,7 @@ def cross_fit_job(
                         image_names[index] for index in evaluation_indices
                     ],
                     "threshold_grid": [float(value) for value in threshold_grid],
-                    "tail_quantiles": [float(value) for value in DEFAULT_TAIL_QUANTILES],
+                    "tail_quantiles": list(quantiles),
                     "curve": [asdict(point) for point in curve],
                     "selections": {
                         str(budget): asdict(point)

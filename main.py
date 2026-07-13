@@ -25,7 +25,9 @@ from model.omm_flow import (
     instance_balanced_logistic_risk,
     omm2d_identity_risk,
 )
+from model.crwd_objective import counterfactual_residue_witness_loss
 from model.mshnet_checkpoint import strip_legacy_dea_lite_head
+from utils.phase_intervention import align_translated_scores, translate_reflect
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -43,6 +45,9 @@ DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
 DEFAULT_WEIGHT_DIR = osp.join(PROJECT_DIR, 'weight')
 DEA_MODEL_TYPES = ('dea', 'predictive_correction')
 CEV_CONTROL_TYPES = ('dea_fine_veto_control', 'dea_cev_control')
+CRWD_DIRECTIONS = ((0, 1), (1, 0), (1, 1))
+CRWD_STRIDE = 16
+CRWD_VERSION = 'counterfactual_residue_witness_projection_v1'
 MSHNET_OBJECTIVES = (
     'sls',
     'omm2d_identity',
@@ -131,11 +136,45 @@ def checkpoint_metadata_dea_lite_enabled(metadata):
         return True
     return bool(metadata.get('dea_lite_enabled', inferred))
 
+
+def get_crwd_training_semantics(args):
+    return {
+        'lambda': float(getattr(args, 'crwd_lambda', 0.0)),
+        'ramp_epochs': int(getattr(args, 'crwd_ramp_epochs', 20)),
+        'protect_kernel': int(getattr(args, 'crwd_protect_kernel', 7)),
+        'target_temperature': float(getattr(args, 'crwd_target_temperature', 0.25)),
+        'tail_temperature': float(getattr(args, 'crwd_tail_temperature', 0.25)),
+        'delta_target': float(getattr(args, 'crwd_delta_target', 0.05)),
+        'delta_margin': float(getattr(args, 'crwd_delta_margin', 0.05)),
+        'tail_tolerance': float(getattr(args, 'crwd_tail_tolerance', 0.05)),
+        'margin_floor': float(getattr(args, 'crwd_margin_floor', 0.0)),
+        'max_margin_credit': float(getattr(args, 'crwd_max_margin_credit', 1.0)),
+        'confidence_width': float(getattr(args, 'crwd_confidence_width', 0.25)),
+        'huber_delta': float(getattr(args, 'crwd_huber_delta', 0.25)),
+        'log_interval': int(getattr(args, 'crwd_log_interval', 50)),
+    }
+
+
+def crwd_enabled(args):
+    return (
+        getattr(args, 'model_type', 'mshnet') == 'mshnet'
+        and get_crwd_training_semantics(args)['lambda'] > 0.0
+    )
+
+
+def checkpoint_metadata_crwd_enabled(metadata):
+    try:
+        inferred = float(metadata.get('crwd_lambda', 0.0)) > 0.0
+    except (TypeError, ValueError):
+        return True
+    return bool(metadata.get('crwd_enabled', inferred))
+
 def is_noncanonical_plain_mshnet_experiment(args):
     return (
         is_noncanonical_mshnet_training(args)
         or is_noncanonical_location_training(args)
         or dea_lite_enabled(args)
+        or crwd_enabled(args)
     )
 
 def str2bool(value):
@@ -202,6 +241,34 @@ def validate_args(args):
         raise ValueError("--dea-ramp-epochs must be non-negative.")
     if any(value > 0.0 for value in lite_lambdas) and args.model_type != 'mshnet':
         raise ValueError("DEA-lite losses require --model-type mshnet.")
+
+    crwd = get_crwd_training_semantics(args)
+    finite_crwd = (
+        'lambda',
+        'target_temperature',
+        'tail_temperature',
+        'delta_target',
+        'delta_margin',
+        'tail_tolerance',
+        'margin_floor',
+        'max_margin_credit',
+        'confidence_width',
+        'huber_delta',
+    )
+    if any(not math.isfinite(crwd[name]) for name in finite_crwd):
+        raise ValueError("CRWD floating-point arguments must be finite.")
+    if crwd['lambda'] < 0.0:
+        raise ValueError("--crwd-lambda must be non-negative.")
+    if crwd['ramp_epochs'] < 0 or crwd['log_interval'] < 0:
+        raise ValueError("CRWD ramp epochs and log interval must be non-negative.")
+    if crwd['protect_kernel'] <= 0 or crwd['protect_kernel'] % 2 == 0:
+        raise ValueError("--crwd-protect-kernel must be a positive odd integer.")
+    if crwd['target_temperature'] <= 0.0 or crwd['tail_temperature'] <= 0.0:
+        raise ValueError("CRWD temperatures must be positive.")
+    if any(crwd[name] < 0.0 for name in ('delta_target', 'delta_margin', 'tail_tolerance')):
+        raise ValueError("CRWD witness thresholds must be non-negative.")
+    if any(crwd[name] <= 0.0 for name in ('max_margin_credit', 'confidence_width', 'huber_delta')):
+        raise ValueError("CRWD credit/confidence/Huber scales must be positive.")
 
     if args.model_type == "dea_integrated":
         if args.if_checkpoint and args.init_from_baseline:
@@ -417,6 +484,21 @@ def validate_args(args):
             raise ValueError(
                 "instance-risk objectives and DEA-lite losses must not be mixed"
             )
+    if crwd['lambda'] > 0.0:
+        if args.model_type != 'mshnet':
+            raise ValueError("CRWD requires --model-type mshnet")
+        if objective != 'sls':
+            raise ValueError("CRWD requires the canonical SLS objective")
+        if side_supervision != 'canonical' or train_graph != 'canonical_warm':
+            raise ValueError(
+                "CRWD requires canonical side supervision and warm training graph"
+            )
+        if is_noncanonical_location_training(args):
+            raise ValueError("CRWD cannot be mixed with location-loss controls")
+        if dea_lite_enabled(args):
+            raise ValueError("CRWD and DEA-lite must not be enabled together")
+        if bool(args.multi_gpus):
+            raise ValueError("CRWD v1 requires single-GPU training")
     return args
 
 def get_method_name(args):
@@ -466,6 +548,8 @@ def get_method_name(args):
         if version == "v5":
             return "FullDEA-v5-CRR-HT"
         return "FullDEA-v3-TPS"
+    if args.model_type == 'mshnet' and crwd_enabled(args):
+        return "CRWD-MSHNet-S%d" % CRWD_STRIDE
     if args.model_type == "mshnet" and is_noncanonical_location_training(args):
         location_loss, side_location_loss, lambda_location = (
             get_location_training_semantics(args)
@@ -514,6 +598,7 @@ def get_method_metadata(args):
     mshnet_objective, mshnet_side_supervision, mshnet_train_graph = (
         get_mshnet_training_semantics(args)
     )
+    crwd = get_crwd_training_semantics(args)
     return {
         "method": get_method_name(args),
         "model_type": args.model_type,
@@ -542,6 +627,26 @@ def get_method_metadata(args):
         "omm2d_connectivity": 2,
         "instance_fa_reduction": "batch_pixel_mean",
         "instance_miss_reduction": "batch_global_instance_mean",
+        "crwd_enabled": bool(crwd_enabled(args)),
+        "crwd_version": CRWD_VERSION,
+        "crwd_lambda": crwd['lambda'],
+        "crwd_ramp_epochs": crwd['ramp_epochs'],
+        "crwd_stride": CRWD_STRIDE,
+        "crwd_directions": [list(value) for value in CRWD_DIRECTIONS],
+        "crwd_budgets_fa_per_mpix": [1, 5, 10, 20],
+        "crwd_protect_kernel": crwd['protect_kernel'],
+        "crwd_target_temperature": crwd['target_temperature'],
+        "crwd_tail_temperature": crwd['tail_temperature'],
+        "crwd_delta_target": crwd['delta_target'],
+        "crwd_delta_margin": crwd['delta_margin'],
+        "crwd_tail_tolerance": crwd['tail_tolerance'],
+        "crwd_margin_floor": crwd['margin_floor'],
+        "crwd_max_margin_credit": crwd['max_margin_credit'],
+        "crwd_confidence_width": crwd['confidence_width'],
+        "crwd_huber_delta": crwd['huber_delta'],
+        "crwd_log_interval": crwd['log_interval'],
+        "crwd_teacher": "same_checkpoint_eval_no_grad",
+        "crwd_student_inference": "canonical_single_view_original_mshnet",
         "full_dea_lambda": float(args.full_dea_lambda),
         "full_dea_ramp_epochs": int(args.full_dea_ramp_epochs),
         "full_dea_start_epoch": int(args.full_dea_start_epoch),
@@ -679,6 +784,19 @@ def parse_args():
         default='canonical_warm',
         choices=MSHNET_TRAIN_GRAPHS,
     )
+    parser.add_argument('--crwd-lambda', type=float, default=0.0)
+    parser.add_argument('--crwd-ramp-epochs', type=int, default=20)
+    parser.add_argument('--crwd-protect-kernel', type=int, default=7)
+    parser.add_argument('--crwd-target-temperature', type=float, default=0.25)
+    parser.add_argument('--crwd-tail-temperature', type=float, default=0.25)
+    parser.add_argument('--crwd-delta-target', type=float, default=0.05)
+    parser.add_argument('--crwd-delta-margin', type=float, default=0.05)
+    parser.add_argument('--crwd-tail-tolerance', type=float, default=0.05)
+    parser.add_argument('--crwd-margin-floor', type=float, default=0.0)
+    parser.add_argument('--crwd-max-margin-credit', type=float, default=1.0)
+    parser.add_argument('--crwd-confidence-width', type=float, default=0.25)
+    parser.add_argument('--crwd-huber-delta', type=float, default=0.25)
+    parser.add_argument('--crwd-log-interval', type=int, default=50)
 
     parser.add_argument('--base-size', type=int, default=256)
     parser.add_argument('--crop-size', type=int, default=256)
@@ -851,7 +969,10 @@ class Trainer(object):
         setattr(
             args,
             'return_instance_labels',
-            getattr(args, 'mshnet_objective', 'sls') != 'sls',
+            (
+                getattr(args, 'mshnet_objective', 'sls') != 'sls'
+                or crwd_enabled(args)
+            ),
         )
         self.start_epoch = 0   
         self.mode = args.mode
@@ -1194,11 +1315,13 @@ class Trainer(object):
                     'lambda_location', 1.0
                 )) != 1.0
                 or checkpoint_metadata_dea_lite_enabled(checkpoint_metadata)
+                or checkpoint_metadata_crwd_enabled(checkpoint_metadata)
             )
         )
         checkpoint_dea_lite = checkpoint_metadata_dea_lite_enabled(
             checkpoint_metadata
         )
+        checkpoint_crwd = checkpoint_metadata_crwd_enabled(checkpoint_metadata)
         requires_metadata = (
             self.args.model_type == 'dea_integrated'
             or is_dea_main_model(self.args.model_type)
@@ -1255,6 +1378,29 @@ class Trainer(object):
                     'dea_tau',
                     'dea_ramp_epochs',
                     'dea_detach_evidence',
+                )
+            if crwd_enabled(self.args) or checkpoint_crwd:
+                semantic_keys = semantic_keys + (
+                    'crwd_enabled',
+                    'crwd_version',
+                    'crwd_lambda',
+                    'crwd_ramp_epochs',
+                    'crwd_stride',
+                    'crwd_directions',
+                    'crwd_budgets_fa_per_mpix',
+                    'crwd_protect_kernel',
+                    'crwd_target_temperature',
+                    'crwd_tail_temperature',
+                    'crwd_delta_target',
+                    'crwd_delta_margin',
+                    'crwd_tail_tolerance',
+                    'crwd_margin_floor',
+                    'crwd_max_margin_credit',
+                    'crwd_confidence_width',
+                    'crwd_huber_delta',
+                    'crwd_log_interval',
+                    'crwd_teacher',
+                    'crwd_student_inference',
                 )
         elif is_cev_control(self.args.model_type):
             semantic_keys = (
@@ -1461,6 +1607,87 @@ class Trainer(object):
             # the first optimization step.
             return True
         return epoch > self.warm_epoch
+
+    def get_crwd_ramp(self, epoch):
+        if not crwd_enabled(self.args) or epoch <= self.warm_epoch:
+            return 0.0
+        ramp_epochs = get_crwd_training_semantics(self.args)['ramp_epochs']
+        if ramp_epochs <= 0:
+            return 1.0
+        return min(1.0, float(epoch - self.warm_epoch) / float(ramp_epochs))
+
+    def crwd_phase_pair(self, epoch, iteration):
+        step = int(epoch) * len(self.train_loader) + int(iteration)
+        direction = CRWD_DIRECTIONS[step % len(CRWD_DIRECTIONS)]
+        control = tuple(CRWD_STRIDE * value for value in direction)
+        residue = tuple((CRWD_STRIDE + 1) * value for value in direction)
+        return direction, control, residue
+
+    def compute_crwd_training_objective(
+        self,
+        data,
+        canonical_logits,
+        labels,
+        instance_labels,
+        epoch,
+        iteration,
+    ):
+        if instance_labels is None:
+            raise RuntimeError('CRWD requires instance labels from the DataLoader')
+        if canonical_logits.shape != labels.shape:
+            raise RuntimeError('CRWD canonical logits and labels must align')
+        direction, control_offset, residue_offset = self.crwd_phase_pair(
+            epoch, iteration
+        )
+        training_flags = {
+            module: bool(module.training) for module in self.model.modules()
+        }
+        try:
+            self.model.eval()
+            with torch.no_grad():
+                control_input = translate_reflect(data, control_offset)
+                residue_input = translate_reflect(data, residue_offset)
+                _, control_raw = self.model(control_input, True)
+                _, residue_raw = self.model(residue_input, True)
+                control_aligned, control_valid = align_translated_scores(
+                    control_raw,
+                    control_offset,
+                    fill_value=0.0,
+                )
+                residue_aligned, residue_valid = align_translated_scores(
+                    residue_raw,
+                    residue_offset,
+                    fill_value=0.0,
+                )
+        finally:
+            for module, was_training in training_flags.items():
+                module.training = was_training
+
+        crwd = get_crwd_training_semantics(self.args)
+        result = counterfactual_residue_witness_loss(
+            canonical_logits=canonical_logits,
+            control_logits=control_aligned,
+            residue_logits=residue_aligned,
+            control_validity=control_valid,
+            residue_validity=residue_valid,
+            target=labels,
+            instance_labels=instance_labels,
+            protect_kernel=crwd['protect_kernel'],
+            target_temperature=crwd['target_temperature'],
+            tail_temperature=crwd['tail_temperature'],
+            delta_target=crwd['delta_target'],
+            delta_margin=crwd['delta_margin'],
+            tail_tolerance=crwd['tail_tolerance'],
+            margin_floor=crwd['margin_floor'],
+            max_margin_credit=crwd['max_margin_credit'],
+            confidence_width=crwd['confidence_width'],
+            huber_delta=crwd['huber_delta'],
+            validate_instance_labels=False,
+        )
+        result['direction'] = direction
+        result['control_offset'] = control_offset
+        result['residue_offset'] = residue_offset
+        return result
 
     def get_full_dea_ramp(self, epoch):
         if epoch < self.args.full_dea_start_epoch:
@@ -1839,6 +2066,62 @@ class Trainer(object):
         }
 
     @staticmethod
+    def new_crwd_audit():
+        return {
+            'raw_loss_times_images': 0.0,
+            'weighted_loss_times_images': 0.0,
+            'witness_components': 0,
+            'witness_events': 0,
+            'eligible_components': 0,
+            'skipped_invalid_components': 0,
+            'candidate_count_times_batches': 0,
+            'active_batches': 0,
+            'images': 0,
+            'direction_counts': {str(value): 0 for value in CRWD_DIRECTIONS},
+        }
+
+    @staticmethod
+    def update_crwd_audit(audit, result, weighted_loss, batch_size):
+        audit['raw_loss_times_images'] += float(result['loss'].detach()) * batch_size
+        audit['weighted_loss_times_images'] += float(weighted_loss.detach()) * batch_size
+        for name in (
+            'witness_components',
+            'witness_events',
+            'eligible_components',
+            'skipped_invalid_components',
+        ):
+            audit[name] += int(result[name])
+        audit['candidate_count_times_batches'] += int(result['candidate_count'])
+        audit['active_batches'] += 1
+        audit['images'] += int(batch_size)
+        audit['direction_counts'][str(tuple(result['direction']))] += 1
+
+    def finalize_crwd_audit(self, audit, epoch):
+        report = {
+            'epoch': int(epoch),
+            'schema_version': 'dea.crwd.train_epoch.v1',
+            'crwd_version': CRWD_VERSION,
+            'ramp': self.get_crwd_ramp(epoch),
+            'raw_loss_image_mean': (
+                audit['raw_loss_times_images'] / max(1, audit['images'])
+            ),
+            'weighted_loss_image_mean': (
+                audit['weighted_loss_times_images'] / max(1, audit['images'])
+            ),
+            'candidate_count_batch_mean': (
+                audit['candidate_count_times_batches']
+                / max(1, audit['active_batches'])
+            ),
+            **audit,
+        }
+        with open(
+            osp.join(self.save_folder, 'crwd_train.jsonl'),
+            'a',
+        ) as handle:
+            handle.write(json.dumps(report, sort_keys=True) + '\n')
+        print('[CRWD] ' + json.dumps(report, sort_keys=True))
+
+    @staticmethod
     def update_instance_objective_audit(audit, result, batch_size):
         audit['optimization_loss_times_images'] += float(
             result['loss'].detach()
@@ -1888,6 +2171,7 @@ class Trainer(object):
             )
             else None
         )
+        crwd_audit = self.new_crwd_audit() if crwd_enabled(self.args) else None
         for i, batch in enumerate(tbar):
             if len(batch) == 3:
                 data, mask, instance_labels = batch
@@ -1986,6 +2270,45 @@ class Trainer(object):
                     )
                 loss = loss / (len(masks)+1)
             loss_seg_for_debug = loss.detach()
+            crwd_result = None
+            crwd_ramp = self.get_crwd_ramp(epoch)
+            if crwd_ramp > 0.0:
+                if self.args.model_type != 'mshnet':
+                    raise RuntimeError('CRWD reached a non-MSHNet training path')
+                crwd_result = self.compute_crwd_training_objective(
+                    data,
+                    pred,
+                    labels,
+                    instance_labels,
+                    epoch,
+                    i,
+                )
+                weighted_crwd = (
+                    get_crwd_training_semantics(self.args)['lambda']
+                    * crwd_ramp
+                    * crwd_result['loss']
+                )
+                loss = loss + weighted_crwd
+                self.update_crwd_audit(
+                    crwd_audit,
+                    crwd_result,
+                    weighted_crwd,
+                    pred.shape[0],
+                )
+                log_interval = get_crwd_training_semantics(self.args)['log_interval']
+                if log_interval > 0 and i % log_interval == 0:
+                    print(
+                        '[CRWD BATCH] ramp=%.4f raw=%.6f weighted=%.6f '
+                        'witness_components=%d witness_events=%d direction=%s'
+                        % (
+                            crwd_ramp,
+                            float(crwd_result['loss'].detach()),
+                            float(weighted_crwd.detach()),
+                            int(crwd_result['witness_components']),
+                            int(crwd_result['witness_events']),
+                            tuple(crwd_result['direction']),
+                        )
+                    )
             integrated_route_loss = None
             integrated_route_log = {}
             integrated_route_ramp = 0.0
@@ -2164,6 +2487,8 @@ class Trainer(object):
                 )
         if instance_audit is not None:
             self.finalize_instance_objective_audit(instance_audit, epoch)
+        if crwd_audit is not None:
+            self.finalize_crwd_audit(crwd_audit, epoch)
     
     def test(self, epoch):
         self.model.eval()
