@@ -62,6 +62,7 @@ SMOKE_EPOCHS = legacy_probe.PROBE_SMOKE_EPOCHS
 VARIANT_ORDER = legacy_probe.ALL_VARIANTS
 LOCKED_BASE_SIZE = 256
 LOCKED_CROP_SIZE = 256
+NATIVE_REPLAY_ABS_TOL = 1e-12
 
 BUNDLE_FILES = (
     "summary.json",
@@ -436,7 +437,12 @@ def _loader(
         kwargs["prefetch_factor"] = 2
     loader = DataLoader(
         dataset,
-        batch_size=legacy_probe.PROBE_BATCH_SIZE,
+        # The frozen checkpoint was selected with the canonical evaluator's
+        # batch-size-one test loader.  Retaining that execution shape here is
+        # part of the native-replay contract: otherwise CUDA convolution
+        # kernels can differ at threshold-adjacent pixels even though the
+        # weights and images are identical.
+        batch_size=legacy_probe.PROBE_BATCH_SIZE if training else 1,
         shuffle=training,
         drop_last=False,
         **kwargs,
@@ -503,9 +509,9 @@ def build_native_selected_checkpoint_replay(
     """Exactly replay MSHNet's native logit-zero operating point.
 
     The replay intentionally uses integer pooled counts and the repository's
-    historical target-ordered component matcher.  Checkpoint metadata is not
-    accepted as the metric authority; it is retained only as a bound reference
-    so small legacy reporting differences remain visible rather than hidden.
+    historical target-ordered component matcher.  The recomputed metrics are
+    the arithmetic authority and must reproduce the independently selected
+    checkpoint metrics to the predeclared absolute tolerance.
     """
 
     if not scores or len(scores) != len(targets):
@@ -626,6 +632,22 @@ def build_native_selected_checkpoint_replay(
         "pd": float(checkpoint_record["selected_pd"]),
         "fa_per_mpix": float(checkpoint_record["selected_fa_per_mpix"]),
     }
+    replayed = {
+        "iou": float(pixel["iou"]),
+        "pd": pd,
+        "fa_per_mpix": fa_per_mpix,
+    }
+    differences = {
+        key: replayed[key] - reported[key]
+        for key in ("iou", "pd", "fa_per_mpix")
+    }
+    for metric, difference in differences.items():
+        if abs(difference) > NATIVE_REPLAY_ABS_TOL:
+            raise FullTrainTestProbeError(
+                "native original_final_z replay does not reproduce selected "
+                f"checkpoint {metric} within absolute tolerance "
+                f"{NATIVE_REPLAY_ABS_TOL}: delta={difference}"
+            )
     return {
         "schema": NATIVE_REPLAY_SCHEMA,
         "source_variant": "original_final_z",
@@ -663,14 +685,16 @@ def build_native_selected_checkpoint_replay(
             "fa_per_mpix": fa_per_mpix,
         },
         "checkpoint_reported_metrics": reported,
-        "replay_minus_checkpoint_reported": {
-            "iou": float(pixel["iou"]) - reported["iou"],
-            "pd": pd - reported["pd"],
-            "fa_per_mpix": fa_per_mpix - reported["fa_per_mpix"],
+        "checkpoint_metric_binding": {
+            "status": "passed",
+            "absolute_tolerance": NATIVE_REPLAY_ABS_TOL,
+            "relative_tolerance": 0.0,
+            "metrics": ["iou", "pd", "fa_per_mpix"],
         },
+        "replay_minus_checkpoint_reported": differences,
         "metric_authority": (
             "integer replay from saved original_final_z logits and canonical test "
-            "targets; checkpoint metrics are reference metadata only"
+            "targets; exact agreement binds it to the selected checkpoint"
         ),
     }
 

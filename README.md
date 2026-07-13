@@ -5,7 +5,8 @@ This repository is an experimental research workspace built around the CVPR
 the canonical MSHNet baseline, historical DEA prototypes, and a growing set of
 read-only tools for component-level error analysis, low-false-alarm operating
 points, cross-seed persistence, feature and phase survival, protocol-locked
-baseline selection, and evidence-to-decision conversion.
+baseline selection, exact structured-prediction audits, and
+evidence-to-decision conversion.
 
 The default training path remains the original MSHNet topology and SLS
 objective. Experimental objectives and DEA variants are explicit opt-in
@@ -46,6 +47,12 @@ Current evidence gates are conservative:
   component-tree filtration, bounded-treewidth connected-subset CRFs,
   hard-core polymer fields, anytime-valid component processes, and closed-walk
   occupancy readout are **NO-GO** as the current primary method route.
+- TRACE-MSHNet v1 completed its implementation and pretraining gates. Its exact
+  sum/max run-semiring passed mathematical verification, but the row-convex
+  state family failed 100% train-only GT representation on all three datasets
+  and its measured prediction-end latency was `24.64x` the canonical model,
+  above the preregistered `2x` limit. TRACE-v1 is therefore **FINAL NO-GO**;
+  formal training and performance claims remain prohibited.
 - OHR-MSHNet is **RETRACTED / FINAL NO-GO**. Its occupancy-probability premise
   is not justified by SLS side outputs or the actual MSHNet inference graph,
   and existing fusion evidence does not support the proposed replacement.
@@ -64,6 +71,8 @@ The governing definitions and latest status are documented in:
 - [Updated repository audit and AAAI route decision](DEA_Updated_Repo_Audit_and_AAAI_Model_Routing_2026-07-12.md)
 - [Strict DER implementation and method audit](DEA_Current_Main_Strict_Audit_and_AAAI_Model_Decision_2026-07-12.md)
 - [Baseline bottleneck and sequential-freeze decision](MSHNet_Baseline_Strength_Bottleneck_and_Sequential_Freeze_2026-07-13.md)
+- [TRACE-MSHNet pre-gate design record](DEA_TRACE_MSHNet_AAAI27_Model_Design_2026-07-13.md)
+- [TRACE-MSHNet implementation and final gate report](DEA_TRACE_MSHNet_Implementation_and_Gate_Report_2026-07-13.md)
 - [Decision conversion and evidence utilization](MSHNet_Decision_Conversion_Gate_and_Evidence_Utilization_Plan.md)
 - [CCSR formal audit](MSHNet_CCSR_Formal_Audit_and_Corrected_Spec.md)
 - [CCSR novelty and modification plan](MSHNet_CCSR_Novelty_and_Code_Modification_Plan.md)
@@ -92,6 +101,9 @@ must always be named separately.
 |   |-- mshnet_d0_backbone.py       # exact, headless canonical input-to-d0 front
 |   |-- signed_local_reference.py   # frozen Gate K readout controls
 |   |-- crwd_objective.py           # opt-in counterfactual witness objective
+|   |-- trace_front.py              # provenance-locked frozen d0 front
+|   |-- trace_mshnet.py             # TRACE-v1 atomic field and exact NLL
+|   |-- trace_run_semiring.py       # exact sum/max semiring reference
 |   |-- loss.py                     # SLS and explicit location-loss modes
 |   |-- ccsr/                       # CCSR reference-only implementations
 |   |-- omm_flow.py                 # instance-balanced objective controls
@@ -106,10 +118,12 @@ must always be named separately.
 |   |-- phase_intervention.py
 |   |-- rooted_component_program.py # mechanical codec/control, not a method
 |   |-- full_train_test_protocol.py # canonical full-train/test-selected lock
+|   |-- trace_*.py                  # TRACE codec, geometry, gates, and provenance
 |   |-- nested_component_grid.py
 |   |-- risk_control_feasibility.py
 |   `-- target_identity.py
 |-- tools/                           # reproducible audit/finalization CLIs
+|   `-- *trace*.py                  # TRACE audits, profiling, train/eval guards
 |-- tests/                           # unit and protocol regression tests
 |-- datasets/                        # local only; ignored by Git
 |-- weight/                          # local only; ignored by Git
@@ -213,7 +227,9 @@ matching, target identity, CCSR references, feature survival, decision
 conversion, low-FA cross-fitting, nested-grid sensitivity, risk-control
 feasibility, component-frontier decomposition, phase intervention, frozen-front
 equivalence, signed-readout finalization, full-train/test protocol locking,
-rooted-component mechanical contracts, and cross-seed persistence.
+rooted-component mechanical contracts, TRACE codec/geometry/provenance,
+exact semiring equivalence and gradients, TRACE training/evaluation fail-closed
+behavior, and cross-seed persistence.
 
 ## Experimental Boundaries
 
@@ -230,6 +246,10 @@ rooted-component mechanical contracts, and cross-seed persistence.
 - CRWD is disabled by default (`--crwd-lambda 0`) and keeps canonical MSHNet
   inference. Its implementation and tests do not establish method validity or
   publishable gains.
+- TRACE-v1 is retained as a reproducible negative result. Its design record is
+  superseded by the final gate report; `tools/train_trace.py` must reject the
+  current failed geometry and integration reports before optimization starts.
+  Do not run formal TRACE-v1 training or report model gains.
 - Do not report audit-Hungarian values as official legacy metrics.
 - Do not treat oracle threshold sweeps as deployable cross-fitted performance.
 - Official test sets remain sealed until the method and evaluation protocol
